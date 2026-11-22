@@ -65,7 +65,6 @@ from utils.metrics import sigmoid_focal_loss, dice_loss
 from utils.metrics import plot_all_metrics
 from utils.validate import validate
 from utils.checkpoint_state import build_checkpoint_payload, load_matching_state_dict
-from utils.live_reload_diagnostics import compare_models_on_batches
 
 def get_max_streams() -> int:
     """
@@ -316,6 +315,7 @@ def run_live_reload_diagnostic(
     than validation sampling.
     """
     from test_dataset import load_and_initialize_model
+    from utils.live_reload_diagnostics import compare_models_on_batches
 
     logger.info(
         "Running live-vs-reload diagnostic | checkpoint=%s batches=%s",

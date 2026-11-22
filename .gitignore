@@ -8,8 +8,10 @@ venv/
 # local data and outputs
 data/
 dataset/
-outputs/*
-!outputs/.gitkeep
+datasets/
+*.parquet
+**/outputs/*
+!**/outputs/.gitkeep
 results/
 repro_eval/*/outputs/
 
@@ -18,6 +20,6 @@ repro_eval/*/outputs/
 *.pt
 *.ckpt
 *.safetensors
-checkpoints/*
-!checkpoints/.gitkeep
-FLAME/sam2configs/*.pt
+**/checkpoints/*
+!**/checkpoints/.gitkeep
+!**/checkpoints/README.md
