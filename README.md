@@ -48,16 +48,20 @@ The default dataset configuration is:
 FLAME/configs/datasets_default.json
 ```
 
-Edit `data_root` and/or each dataset `path` in this file to match your local dataset layout. Relative dataset paths are resolved under `data_root`.
+The default `data_root` is the `datasets` directory next to the FLAME repository. Set `data_root` or individual dataset paths in the JSON file if your data lives elsewhere. Relative dataset paths are resolved under `data_root`.
 
-The default config contains training and validation entries for MagicBrush and SID:
+The default configuration uses MagicBrush `train` and `dev` and the SID training and validation subsets. The two test splits are used by the evaluation entry point.
 
 ```text
-data/
-  magicbrush_multiedit_train/
-  magicbrush_multiedit_val/
-  sid_train/
-  sid_validation/
+../datasets/
+  MagicBrush/imgs/
+    train/
+    dev/
+    test/
+  SID_Set/imgs/
+    sid_train/
+    sid_validation/
+    sid_test/
 ```
 
 Each dataset directory should follow the expected FLAME dataset structure used by `LocalForgeryDataset`.
@@ -69,7 +73,7 @@ By default, `train.py` uses `FLAME/configs/datasets_default.json` for both train
 ```bash
 python FLAME/train.py \
   --dataset_config FLAME/configs/datasets_default.json \
-  --sam_config FLAME/sam2configs/sam2.1_hiera_b+.yaml \
+  --sam_config sam2.1_hiera_b+.yaml \
   --sam_ckpt FLAME/sam2configs/sam2.1_hiera_base_plus.pt \
   --sam_backend sam2 \
   --img_size 512 \
@@ -84,6 +88,15 @@ python FLAME/train.py --help
 ```
 
 ## 5. Evaluate one dataset directory
+
+From the repository root, the wrapper evaluates the prepared MagicBrush test split by default. Pass the SID test directory to evaluate the separately prepared SID test split.
+
+```bash
+python FLAME/run_flame.py test
+python FLAME/run_flame.py test \
+  --dataset ../datasets/SID_Set/imgs/sid_test \
+  --output FLAME/outputs/sid_test
+```
 
 ```bash
 python FLAME/test_dataset.py \

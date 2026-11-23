@@ -1,0 +1,137 @@
+conda activate flame
+python -m pip install pyarrow Pillow
+
+python -u - <<'PY'
+from collections import defaultdict
+from io import BytesIO
+from pathlib import Path
+from shutil import copyfile
+
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
+from PIL import Image, ImageChops
+
+DATASETS = Path("/mnt/storage/datasets")
+MAGICBRUSH_COUNTS = {"train": 8807, "dev": 528, "test": 1053}
+POSITIVE = [0] + [255] * 255
+TRANSPARENT = [255] + [0] * 255
+
+
+def rows(files, columns, tampered_only=False):
+    for path in files:
+        print(f"Reading {path.name}")
+        with pq.ParquetFile(path) as parquet:
+            for batch in parquet.iter_batches(batch_size=8, columns=columns):
+                if tampered_only:
+                    batch = batch.filter(pc.equal(batch.column("label"), 2))
+                yield from batch.to_pylist()
+
+
+def folders(root, *names):
+    paths = [root / name for name in names]
+    for path in paths:
+        path.mkdir(parents=True, exist_ok=True)
+    return paths
+
+
+def save_image(data, output):
+    with Image.open(BytesIO(data)) as image:
+        if image.format == "PNG":
+            output.write_bytes(data)
+        else:
+            image.convert("RGB").save(output, compress_level=1)
+        return image.size
+
+
+def export_magicbrush(data):
+    columns = ["img_id", "turn_index", "source_img", "target_img", "mask_img"]
+    for split, expected in MAGICBRUSH_COUNTS.items():
+        files = sorted(data.glob(f"{split}-*.parquet"))
+        samples = sum(pq.read_metadata(path).num_rows for path in files)
+        if samples != expected:
+            raise RuntimeError(
+                f"MagicBrush {split}: found {samples} rows, expected {expected}"
+            )
+
+        output = data.parent / "imgs" / split
+        target_dir, mask_dir, source_dir = folders(output, "target", "mask", "source")
+        sessions = defaultdict(dict)
+
+        for row in rows(files, columns):
+            image_id = str(row["img_id"])
+            turn = int(row["turn_index"])
+            turns = sessions[image_id]
+            if turn in turns:
+                raise ValueError(f"Duplicate MagicBrush sample: {image_id}, turn {turn}")
+
+            name = f"{image_id}_turn{turn}.png"
+            if not turns or turn < min(turns):
+                save_image(row["source_img"]["bytes"], source_dir / name)
+            turns[turn] = name
+
+            size = save_image(row["target_img"]["bytes"], target_dir / name)
+            with Image.open(BytesIO(row["mask_img"]["bytes"])) as raw:
+                rgba = raw.convert("RGBA")
+                alpha = rgba.getchannel("A")
+                if alpha.getextrema() == (255, 255):
+                    mask = rgba.getchannel("R").point(POSITIVE)
+                else:
+                    mask = alpha.point(TRANSPARENT)
+            mask.resize(size, Image.Resampling.NEAREST).save(mask_dir / name)
+
+        # Split files may contain different turns from the same session.
+        for turns in sessions.values():
+            names = [turns[turn] for turn in sorted(turns)]
+            original = source_dir / names[0]
+            cumulative = None
+            for name in names:
+                with Image.open(mask_dir / name) as image:
+                    current = image.copy()
+                if cumulative is not None:
+                    earlier = cumulative.resize(current.size, Image.Resampling.NEAREST)
+                    current = ImageChops.lighter(earlier, current)
+                cumulative = current
+                cumulative.save(mask_dir / name)
+                if name != names[0]:
+                    copyfile(original, source_dir / name)
+
+        print(f"MagicBrush {split}: {samples} pairs -> {output}")
+
+
+def export_sid(data, split, limit):
+    output = data.parent / "imgs" / f"sid_{split}"
+    target_dir, mask_dir = folders(output, "target", "mask")
+    done = {p.name for p in target_dir.glob("*.png") if (mask_dir / p.name).is_file()}
+    files = sorted(data.glob(f"{split}-*.parquet"))
+
+    if len(done) < limit:
+        for row in rows(files, ["img_id", "image", "mask", "label"], tampered_only=True):
+            name = f"{row['img_id']}.png"
+            if name in done or not row["mask"] or not row["mask"]["bytes"]:
+                continue
+
+            size = save_image(row["image"]["bytes"], target_dir / name)
+            with Image.open(BytesIO(row["mask"]["bytes"])) as raw:
+                mask = raw.convert("L").point(POSITIVE)
+                mask.resize(size, Image.Resampling.NEAREST).save(mask_dir / name)
+            done.add(name)
+
+            if len(done) == 1 or len(done) % 100 == 0 or len(done) == limit:
+                print(f"SID {split}: {len(done)}/{limit}")
+            if len(done) >= limit:
+                break
+
+    print(f"SID {split}: {len(done)}/{limit} pairs -> {output}")
+    return max(0, limit - len(done))
+
+
+export_magicbrush(DATASETS / "MagicBrush" / "data")
+
+sid_data = DATASETS / "SID_Set" / "data"
+short_train = export_sid(sid_data, "train", 10_000)
+short_val = export_sid(sid_data, "validation", 528)
+if short_train or short_val:
+    raise SystemExit(
+        f"Local SID shards are short by train={short_train}, validation={short_val}."
+    )
+PY

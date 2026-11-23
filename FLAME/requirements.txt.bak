@@ -1,0 +1,16 @@
+torch==2.5.1
+torchvision==0.20.1
+numpy>=1
+matplotlib
+kornia
+scikit-image
+scikit-learn
+tqdm
+Pillow
+seaborn
+pandas
+transformers
+sam2
+datasets
+opencv-python
+hydra-core

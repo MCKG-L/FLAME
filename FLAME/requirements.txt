@@ -1,5 +1,5 @@
-torch>=1.9.0
-torchvision>=0.10.0
+torch==2.5.1
+torchvision==0.20.1
 numpy>=1
 matplotlib
 kornia
@@ -10,7 +10,6 @@ Pillow
 seaborn
 pandas
 transformers
-sam2
 datasets
 opencv-python
 hydra-core

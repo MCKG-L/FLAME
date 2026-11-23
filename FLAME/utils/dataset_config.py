@@ -6,6 +6,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, asdict
+from pathlib import Path
 from typing import Dict, List, Optional, Any, Union, Mapping
 
 import torch
@@ -16,6 +17,7 @@ from .train_utils import custom_collate_fn
 from .validation_manifest import apply_manifest_to_dataset, manifest_entries_by_name
 
 logger = logging.getLogger(__name__)
+DEFAULT_DATA_ROOT = str(Path(__file__).resolve().parents[3] / "datasets")
 
 
 @dataclass
@@ -52,7 +54,7 @@ class DataLoaderConfig:
 @dataclass
 class DatasetManagerConfig:
     """Main configuration for dataset management."""
-    data_root: str = "FLAME/data"
+    data_root: str = DEFAULT_DATA_ROOT
     train_datasets: List[DatasetConfig] = None
     val_datasets: List[DatasetConfig] = None
     train_loader: DataLoaderConfig = None
@@ -289,8 +291,9 @@ def load_dataset_config(config_path: str) -> DatasetManagerConfig:
     train_loader = DataLoaderConfig(**config_dict['train_loader'])
     val_loader = DataLoaderConfig(**config_dict['val_loader'])
     
+    data_root = config_dict.get('data_root')
     return DatasetManagerConfig(
-        data_root=config_dict.get('data_root', 'FLAME/data'),
+        data_root=DEFAULT_DATA_ROOT if data_root is None else data_root,
         train_datasets=train_datasets,
         val_datasets=val_datasets,
         train_loader=train_loader,
@@ -315,11 +318,10 @@ def save_dataset_config(config: DatasetManagerConfig, config_path: str) -> None:
 def create_default_config() -> DatasetManagerConfig:
     """Create a default dataset configuration matching current setup."""
     return DatasetManagerConfig(
-        data_root="FLAME/data",
         train_datasets=[
             DatasetConfig(
                 name="magicbrush_multiedit_train",
-                path="magicbrush_multiedit_train",
+                path="MagicBrush/imgs/train",
                 enabled=True,
                 allow_multiple_targets=False,
                 authentic_ratio=0.0,  # Will be overridden by global setting
@@ -327,7 +329,7 @@ def create_default_config() -> DatasetManagerConfig:
             ),
             DatasetConfig(
                 name="sid_train",
-                path="large_sid_train",
+                path="SID_Set/imgs/sid_train",
                 enabled=True,
                 allow_multiple_targets=False,
                 authentic_ratio=0.0,  # SID doesn't use authentic ratio
@@ -337,7 +339,7 @@ def create_default_config() -> DatasetManagerConfig:
         val_datasets=[
             DatasetConfig(
                 name="magicbrush_val",
-                path="full_magicbrush_val",
+                path="MagicBrush/imgs/dev",
                 enabled=True,
                 allow_multiple_targets=False,
                 authentic_ratio=0.0,  # Usually validation doesn't need authentic samples
@@ -345,7 +347,7 @@ def create_default_config() -> DatasetManagerConfig:
             ),
             DatasetConfig(
                 name="sid_val",
-                path="sid_validation",
+                path="SID_Set/imgs/sid_validation",
                 enabled=True,
                 allow_multiple_targets=False,
                 authentic_ratio=0.0,

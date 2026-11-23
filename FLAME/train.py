@@ -22,7 +22,7 @@ import torch.nn as nn
 from torch.nn.utils import clip_grad_norm_
 
 from utils.train_utils import custom_collate_fn, get_param_strings
-from utils.dataset_config import DatasetManager, load_dataset_config, create_default_config
+from utils.dataset_config import DEFAULT_DATA_ROOT, DatasetManager, load_dataset_config, create_default_config
 from utils.sam_utils import initialize_sam_hydra
 from utils.validation_manifest import load_validation_manifest
 
@@ -2969,9 +2969,9 @@ def main(
         checkpoint_save_mode: full, trainable_only, or none; use none for short diagnostics on low disk
     """
     if sam_config is None:
-        sam_config = "sam2.1_hiera_b+.yaml"
+        sam_config = SAM_CONFIG
     if sam_ckpt is None:
-        sam_ckpt = "sam2configs/sam2.1_hiera_base_plus.pt"
+        sam_ckpt = SAM_CKPT
 
     # Generate experiment name with timestamp and create directories
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -3895,9 +3895,9 @@ def aggregate_epoch_metrics(val_metrics_list: List[Dict[str, Any]]) -> Dict[str,
 
 
 # Configuration constants
-DATA_ROOT = "sam2data"
+DATA_ROOT = DEFAULT_DATA_ROOT
 SAM_CONFIG = "sam2.1_hiera_b+.yaml"
-SAM_CKPT = "sam2configs/sam2.1_hiera_base_plus.pt"
+SAM_CKPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sam2configs", "sam2.1_hiera_base_plus.pt")
 IMG_SIZE = 512
 BATCH_SIZE = 8
 EPOCHS = 3

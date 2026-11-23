@@ -92,8 +92,9 @@ def export_split(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--download-dir", type=Path, default=Path("E:/Datasets/SID_Set"))
-    parser.add_argument("--output-dir", type=Path, default=Path("E:/Datasets/FLAME"))
+    sid_dir = Path(__file__).resolve().parents[2] / "datasets" / "SID_Set"
+    parser.add_argument("--download-dir", type=Path, default=sid_dir)
+    parser.add_argument("--output-dir", type=Path, default=sid_dir / "imgs")
     parser.add_argument("--train-count", type=int, default=10_000)
     parser.add_argument("--validation-count", type=int, default=528)
     args = parser.parse_args()
