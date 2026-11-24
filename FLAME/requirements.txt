@@ -13,3 +13,4 @@ transformers
 datasets
 opencv-python
 hydra-core
+tensorboard

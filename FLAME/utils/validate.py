@@ -90,7 +90,7 @@ def validate(
     device = device if isinstance(device, torch.device) else torch.device(device)
     
     with torch.no_grad():
-        for batch_idx, batch in enumerate(tqdm.tqdm(loader, desc="Validation")):
+        for batch_idx, batch in enumerate(tqdm.tqdm(loader, desc="Validation", dynamic_ncols=True)):
             try:
                 if not batch:
                     logger.warning("Skipping empty batch at index %s", batch_idx)
@@ -1043,7 +1043,7 @@ def create_batch_visualization(source, orig, streams, gt_mask, pred_prob, pred_b
     plt.savefig(batch_save_path, dpi=100, bbox_inches='tight')
     plt.close()
     
-    logger.info("Batch visualization saved to: %s", batch_save_path)
+    logger.debug("Batch visualization saved to: %s", batch_save_path)
 
 
 def normalize_for_display(tensor):

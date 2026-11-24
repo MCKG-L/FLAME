@@ -10,6 +10,7 @@ import os
 import random
 import warnings
 import re
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -18,8 +19,10 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 import torch.nn as nn
 from torch.nn.utils import clip_grad_norm_
+from torch.utils.tensorboard import SummaryWriter
 
 from utils.train_utils import custom_collate_fn, get_param_strings
 from utils.dataset_config import DEFAULT_DATA_ROOT, DatasetManager, load_dataset_config, create_default_config
@@ -28,6 +31,7 @@ from utils.validation_manifest import load_validation_manifest
 
 
 logger = logging.getLogger(__name__)
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 torch.set_float32_matmul_precision("high") 
 # Suppress specific warnings
 warnings.filterwarnings("ignore", message="Can't initialize NVML")
@@ -473,6 +477,7 @@ def train_epoch(
     coarse_dice_weight: float = 0.0,
     reload_diagnostics_batches: int = 0,
     checkpoint_save_mode: str = "full",
+    writer: Optional[SummaryWriter] = None,
 ) -> Tuple[List[float], List[Dict], float, Optional[List[float]]]:
     """
     Train the model for one epoch.
@@ -517,10 +522,14 @@ def train_epoch(
         running_stats["actual_iou"] = 0.0
 
     stats_ema_alpha = 0.05
-    pbar = tqdm.tqdm(loader, desc=f"Training Epoch {epoch}/{total_epochs}", leave=False)
+    pbar = tqdm.tqdm(
+        loader, desc=f"Training Epoch {epoch}/{total_epochs}",
+        leave=False, dynamic_ncols=True, mininterval=0.5,
+    )
     scaler = torch.amp.GradScaler()
 
     for batch_idx, batch in enumerate(pbar):
+        global_step = ((epoch or 1) - 1) * len(loader) + batch_idx + 1
         # Skip the first batch to avoid issues with incomplete batches
         if not model.training:
             raise RuntimeError("Model should be in training mode during train_epoch")
@@ -1096,6 +1105,11 @@ def train_epoch(
                 actual_iou_val = actual_iou.mean().item()
                 current_stats["actual_iou"] = actual_iou_val
 
+            if writer is not None:
+                for name, value in current_stats.items():
+                    writer.add_scalar(f"Train/{name}", value, global_step)
+                writer.add_scalar("Train/learning_rate", lr, global_step)
+
             # Update running statistics with EMA
             if running_stats["count"] == 0:
                 for k, v in current_stats.items():
@@ -1110,7 +1124,7 @@ def train_epoch(
             if train_sam_iou and actual_iou is not None:
                 train_ious.append(actual_iou_val)
 
-            # Print detailed debug information every 20 batches and first 5 batches
+            # Save detailed batch metrics to the training log.
             if batch_idx % 20 == 0 or batch_idx < 5:
                 debug_info = f"Epoch {epoch} Batch {batch_idx}/{len(loader)} | Loss: {loss_val:.6f} | "
                 debug_info += f"Focal: {focal_val:.6f} (scaled: {lambda_focal * focal_val:.6f}) | "
@@ -1193,38 +1207,12 @@ def train_epoch(
             if (batch_idx % 5) == 0 or batch_idx == len(loader) - 1:
                 postfix_dict = {
                     "loss": f"{running_stats['loss']:.4f}",
-                    "focal": f"{running_stats['focal']:.4f}",
-                    "dice": f"{running_stats['dice']:.4f}",
-                    "aux": f"{running_stats['aux_bce']:.4f}",
-                    "area": f"{running_stats['area_reg']:.4f}",
-                    "pcal": f"{running_stats['prompt_calibrator_reg']:.4f}",
-                    "pbias": f"{running_stats['prompt_bias_supervision']:.4f}",
-                    "dres": f"{running_stats['dense_prompt_residual_reg']:.4f}",
-                    "dsres": f"{running_stats['dense_prompt_signed_residual_loss']:.4f}",
-                    "uid": f"{running_stats['dense_prompt_unet_identity_loss']:.4f}",
-                    "ures": f"{running_stats['dense_prompt_unet_residual_loss']:.4f}",
-                    "ploss": f"{running_stats['prompt_loss']:.4f}",
-                    "gloss": f"{running_stats['gate_loss']:.4f}",
-                    "dbgloss": f"{running_stats['dual_branch_gate_loss']:.4f}",
-                    "dbrloss": f"{running_stats['dual_branch_residual_loss']:.4f}",
-                    "dfuse": f"{running_stats['dual_fusion_loss']:.4f}",
-                    "fcal": f"{running_stats['final_logit_calibrator_supervision']:.4f}",
-                    "fsp": f"{running_stats['final_logit_spatial_supervision']:.4f}",
-                    "adp": f"{running_stats['adapter_delta_ratio']:.3f}",
-                    "lr": f"{lr:.6f}",
+                    "lr": f"{lr:.2e}",
                 }
-                
-                if authentic_ratio > 0.0:
-                    postfix_dict["det"] = f"{running_stats['detection_loss']:.4f}"
-                
                 if train_sam_iou:
-                    postfix_dict.update({
-                        "iou_loss": f"{running_stats['iou_loss']:.4f}",
-                        "sam_iou": f"{running_stats['sam_iou']:.4f}",
-                        "actual_iou": f"{running_stats['actual_iou']:.4f}",
-                    })
-                
-                pbar.set_postfix(postfix_dict)
+                    postfix_dict["iou"] = f"{running_stats['actual_iou']:.4f}"
+
+                pbar.set_postfix(postfix_dict, refresh=False)
 
             # Validation at specified intervals
             if (
@@ -1261,6 +1249,19 @@ def train_epoch(
                     val_metrics['iou'],
                 )
                 val_metrics_list.append(val_metrics)
+
+                if writer is not None:
+                    for name, value in val_metrics.items():
+                        if isinstance(value, (int, float, np.number)):
+                            writer.add_scalar(f"Validation/{name}", value, global_step)
+                    for dataset_name, dataset_result in val_metrics.get("dataset_results", {}).items():
+                        for metric in ("iou", "f1"):
+                            writer.add_scalar(
+                                f"Validation/datasets/{dataset_name}/{metric}",
+                                dataset_result[metric],
+                                global_step,
+                            )
+                    writer.flush()
 
                 # Save model if it's the best so far
                 if val_metrics["f1"] + val_metrics["iou"] > best_score:
@@ -1342,10 +1343,14 @@ def train_epoch(
                 model.train()
 
     # Print epoch summary
-    summary = f"\nEpoch {epoch}/{total_epochs} completed. Avg Loss: {np.mean(loss_list):.4f}"
+    summary = f"Epoch {epoch}/{total_epochs} completed. Avg Loss: {np.mean(loss_list):.4f}"
     if train_sam_iou and train_ious:
         summary += f" | Avg Train IoU: {np.mean(train_ious):.4f}"
     logger.info(summary)
+    if writer is not None:
+        if loss_list:
+            writer.add_scalar("Train/epoch_loss", float(np.mean(loss_list)), (epoch or 1) * len(loader))
+        writer.flush()
 
     return loss_list, val_metrics_list, best_score, train_ious
 
@@ -2781,6 +2786,44 @@ def compute_loss(
 # ------------------------------
 
 
+@contextmanager
+def training_logs(experiment_dir: str):
+    """Save training messages and flush TensorBoard events when a run exits."""
+    log_path = os.path.join(experiment_dir, "train.log")
+    tensorboard_dir = os.path.join(experiment_dir, "tensorboard")
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+    file_handler.setLevel(logging.DEBUG)
+    root_logger = logging.getLogger()
+    previous_level = root_logger.level
+    previous_log_levels = {
+        detail_logger: detail_logger.level
+        for detail_logger in (logger, logging.getLogger("utils.validate"))
+    }
+    root_logger.setLevel(logging.INFO)
+    for detail_logger in previous_log_levels:
+        detail_logger.setLevel(logging.DEBUG)
+    root_logger.addHandler(file_handler)
+    try:
+        with logging_redirect_tqdm(loggers=[root_logger]):
+            for handler in root_logger.handlers:
+                if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+                    handler.setLevel(logging.INFO)
+            with SummaryWriter(log_dir=tensorboard_dir, flush_secs=30) as writer:
+                logger.info("Training log saved to %s", os.path.abspath(log_path))
+                logger.info("TensorBoard events saved to %s", os.path.abspath(tensorboard_dir))
+                yield writer
+    except BaseException:
+        logger.exception("Training stopped before completion")
+        raise
+    finally:
+        root_logger.removeHandler(file_handler)
+        root_logger.setLevel(previous_level)
+        for detail_logger, level in previous_log_levels.items():
+            detail_logger.setLevel(level)
+        file_handler.close()
+
+
 def main(
     device: torch.device,
     lambda_focal: float,
@@ -2978,828 +3021,830 @@ def main(
     param_strings = get_param_strings()
     experiment_name_raw = f"{timestamp}_DET_" + "_".join(param_strings)
     experiment_name = sanitize_experiment_name(experiment_name_raw)
-    if experiment_name != experiment_name_raw:
-        logger.debug("Sanitized experiment name | raw=%s sanitized=%s", experiment_name_raw, experiment_name)
-    # Ferret-SAM doesn't use perturbation streams
-    max_streams = get_max_streams()
-    final_logit_oracle_thresholds = parse_float_list(final_logit_calibrator_oracle_thresholds)
-    
-    # Enable detection probe when authentic_ratio > 0
-    use_detection_probe = authentic_ratio > 0.0
-    
-    logger.info("Running experiment: %s", experiment_name)
-    logger.info(
-        "Ferret-SAM configuration | max_streams=%s",
-        max_streams,
-    )
-    logger.info("Authentic ratio: %.3f", authentic_ratio)
-    logger.info("Detection probe enabled: %s", use_detection_probe)
-    logger.info("Freeze adapters: %s", freeze_adapters)
-    logger.info("Freeze Ferret/LAD backbone: %s", freeze_ferret)
-    logger.info("Train only Ferret U-Net residual branch: %s", freeze_ferret_unet_only)
-    logger.info("Adapter residual scale: %.4f", adapter_residual_scale)
-    active_adapter_scales = parse_adapter_scales(adapter_scales)
-    active_adapter_sample_gate_scales = parse_adapter_scales(adapter_sample_gate_scales)
-    logger.info("Adapter type: %s", adapter_type)
-    logger.info("Adapter active scales: %s", active_adapter_scales if active_adapter_scales is not None else "all")
-    logger.info(
-        "Adapter sample gate: enabled=%s scales=%s max_delta=%.3f",
-        adapter_sample_gate,
-        active_adapter_sample_gate_scales if active_adapter_sample_gate_scales is not None else "all",
-        adapter_sample_gate_max_delta,
-    )
-    logger.info("Adapter gamma init: %.6f", adapter_gamma_init)
-    logger.info("Adapter delta regularization weight: %.6f", adapter_delta_reg_weight)
-    logger.info("SAM3 prompt mode: %s", sam3_prompt_mode)
-    logger.info("Forensic operator: %s", forensic_operator)
-    parsed_lad_multi_taus = parse_float_list(lad_multi_taus)
-    logger.info("LAD multi taus: %s", parsed_lad_multi_taus if parsed_lad_multi_taus is not None else "default")
-    logger.info(
-        "Coarse prompt transform: %s scale=%.4f bias=%.4f",
-        coarse_prompt_transform,
-        coarse_prompt_scale,
-        coarse_prompt_bias,
-    )
-    logger.info(
-        "Coarse prompt calibrator: %s hidden=%s max_delta_scale=%.4f max_delta_bias=%.4f reg_weight=%.6f",
-        coarse_prompt_calibrator,
-        coarse_prompt_calibrator_hidden,
-        coarse_prompt_calibrator_max_delta_scale,
-        coarse_prompt_calibrator_max_delta_bias,
-        coarse_prompt_calibrator_reg_weight,
-    )
-    logger.info(
-        "Coarse prompt calibrator LR multiplier: %.4f",
-        coarse_prompt_calibrator_lr_multiplier,
-    )
-    logger.info(
-        "Prompt bias oracle supervision | weight=%.6f loss=%s max_delta_bias=%s",
-        prompt_bias_supervision_weight,
-        prompt_bias_supervision_loss,
-        prompt_bias_supervision_max_delta_bias,
-    )
-    logger.info(
-        "Final logit calibrator: %s hidden=%s max_delta_scale=%.4f max_delta_bias=%.4f supervision_weight=%.6f loss=%s supervision_max_delta_bias=%s oracle_thresholds=%s oracle_min=%s oracle_max=%s oracle_fp_penalty=%.4f oracle_area_penalty=%.4f",
-        final_logit_calibrator,
-        final_logit_calibrator_hidden,
-        final_logit_calibrator_max_delta_scale,
-        final_logit_calibrator_max_delta_bias,
-        final_logit_calibrator_supervision_weight,
-        final_logit_calibrator_supervision_loss,
-        final_logit_calibrator_supervision_max_delta_bias,
-        final_logit_oracle_thresholds,
-        final_logit_calibrator_oracle_min_threshold,
-        final_logit_calibrator_oracle_max_threshold,
-        final_logit_calibrator_oracle_false_positive_penalty,
-        final_logit_calibrator_oracle_area_penalty,
-    )
-    logger.info(
-        "Final logit spatial supervision | weight=%.6f loss=%s target_scale=%.4f target_mode=%s hard_threshold=%.4f",
-        final_logit_spatial_supervision_weight,
-        final_logit_spatial_supervision_loss,
-        final_logit_spatial_supervision_target_scale,
-        final_logit_spatial_supervision_target_mode,
-        final_logit_spatial_supervision_hard_threshold,
-    )
-    logger.info(
-        "Coarse prompt refiner: %s hidden=%s max_residual=%.4f gate_init=%.4f gate_max=%.4f precision_bias=%.4f recall_bias=%.4f",
-        coarse_prompt_refiner,
-        coarse_prompt_refiner_hidden,
-        coarse_prompt_refiner_max_residual,
-        coarse_prompt_refiner_gate_init,
-        coarse_prompt_refiner_gate_max,
-        coarse_prompt_refiner_precision_bias,
-        coarse_prompt_refiner_recall_bias,
-    )
-    logger.info(
-        "Coarse prompt U-Net residual scales: gate_init=%s gate_max=%s max_delta=%s",
-        coarse_prompt_unet_gate_init if coarse_prompt_unet_gate_init is not None else coarse_prompt_gate_init,
-        coarse_prompt_unet_gate_max if coarse_prompt_unet_gate_max is not None else coarse_prompt_gate_max,
-        (
-            coarse_prompt_unet_signed_residual_max_delta
-            if coarse_prompt_unet_signed_residual_max_delta is not None
-            else coarse_prompt_signed_residual_max_delta
-        ),
-    )
-    logger.info("Dense prompt residual regularization weight: %.6f", dense_prompt_residual_reg_weight)
-    logger.info("Coarse loss weight: %.4f", coarse_loss_weight)
-    logger.info(
-        "Coarse prompt supervision: source=%s max_gt_area=%s bce_weight=%.4f dice_weight=%.4f fn_weight=%.4f fp_weight=%.4f",
-        coarse_prompt_supervision_source,
-        coarse_prompt_supervision_max_gt_area,
-        coarse_prompt_loss_weight,
-        coarse_prompt_dice_weight,
-        coarse_prompt_false_negative_weight,
-        coarse_prompt_false_positive_weight,
-    )
-    logger.info(
-        "Prompt gate supervision | weight=%.6f source=%s mode=%s gates=%s loss=%s",
-        prompt_gate_supervision_weight,
-        prompt_gate_target_source,
-        prompt_gate_target_mode,
-        prompt_gate_sources,
-        prompt_gate_loss,
-    )
-    logger.info(
-        "Dual-branch prompt gate supervision | weight=%.6f source=%s target_mode=%s hard_threshold=%.3f loss=%s",
-        dual_branch_prompt_gate_supervision_weight,
-        dual_branch_prompt_gate_target_source,
-        dual_branch_prompt_gate_target_mode,
-        dual_branch_prompt_gate_hard_threshold,
-        dual_branch_prompt_gate_loss,
-    )
-    logger.info(
-        "Dual-branch prompt residual supervision | weight=%.6f source=%s loss=%s target_scale=%.4f target_mode=%s hard_threshold=%.3f",
-        dual_branch_prompt_residual_supervision_weight,
-        dual_branch_prompt_residual_target_source,
-        dual_branch_prompt_residual_loss,
-        dual_branch_prompt_residual_target_scale,
-        dual_branch_prompt_residual_target_mode,
-        dual_branch_prompt_residual_hard_threshold,
-    )
-    logger.info(
-        "Dual prompt fusion supervision | weight=%.6f metric=%s loss=%s",
-        dual_prompt_fusion_supervision_weight,
-        dual_prompt_fusion_oracle_metric,
-        dual_prompt_fusion_loss,
-    )
-    logger.info(
-        "Area regularization | weight=%.6f target=%s loss=%s apply_to=%s constant=%.4f max_gt_area=%s",
-        area_reg_weight,
-        area_reg_target_source,
-        area_reg_loss,
-        area_reg_apply_to,
-        area_reg_constant,
-        area_reg_max_gt_area,
-    )
-
-    # Create experiment directory structure
-    experiment_dir = os.path.join("results", experiment_name)
+    experiment_dir = os.path.join(RESULTS_DIR, experiment_name)
     os.makedirs(experiment_dir, exist_ok=True)
     os.makedirs(os.path.join(experiment_dir, "checkpoints"), exist_ok=True)
     os.makedirs(os.path.join(experiment_dir, "vis"), exist_ok=True)
-    
-    if authentic_source_dir:
-        logger.info(
-            "authentic_source_dir is ignored; authentic images use each dataset's root/source folder."
-        )
-        authentic_source_dir = None
 
-    # Collect all parameters for saving
-    model_params = {
-        "experiment_name": experiment_name,
-        "model_config": {
-            "prompt_dim": prompt_dim,
-            "downscale": downscale,
-            "train_sam_iou": train_sam_iou,
-            "dropout_rate": dropout_rate,
-            "lad_tau": lad_tau,
-            "lad_multi_taus": parsed_lad_multi_taus,
-            "forensic_operator": forensic_operator,
-            "sam_backend": sam_backend,
-            "freeze_adapters": freeze_adapters,
-            "freeze_ferret": freeze_ferret,
-            "freeze_ferret_unet_only": freeze_ferret_unet_only,
-            "adapter_residual_scale": adapter_residual_scale,
-            "adapter_type": adapter_type,
-            "adapter_scales": active_adapter_scales,
-            "adapter_gamma_init": adapter_gamma_init,
-            "adapter_sample_gate": adapter_sample_gate,
-            "adapter_sample_gate_scales": active_adapter_sample_gate_scales,
-            "adapter_sample_gate_max_delta": adapter_sample_gate_max_delta,
-            "adapter_forensic_source": adapter_forensic_source,
-            "adapter_diagnostics": adapter_diagnostics,
-            "sam3_prompt_mode": sam3_prompt_mode,
-            "coarse_prompt_transform": coarse_prompt_transform,
-            "coarse_prompt_scale": coarse_prompt_scale,
-            "coarse_prompt_bias": coarse_prompt_bias,
-            "coarse_prompt_calibrator": coarse_prompt_calibrator,
-            "coarse_prompt_calibrator_hidden": coarse_prompt_calibrator_hidden,
-            "coarse_prompt_calibrator_max_delta_scale": coarse_prompt_calibrator_max_delta_scale,
-            "coarse_prompt_calibrator_max_delta_bias": coarse_prompt_calibrator_max_delta_bias,
-            "coarse_prompt_calibrator_lr_multiplier": coarse_prompt_calibrator_lr_multiplier,
-            "prompt_bias_supervision_weight": prompt_bias_supervision_weight,
-            "prompt_bias_supervision_loss": prompt_bias_supervision_loss,
-            "prompt_bias_supervision_max_delta_bias": prompt_bias_supervision_max_delta_bias,
-            "final_logit_calibrator": final_logit_calibrator,
-            "final_logit_calibrator_hidden": final_logit_calibrator_hidden,
-            "final_logit_calibrator_max_delta_scale": final_logit_calibrator_max_delta_scale,
-            "final_logit_calibrator_max_delta_bias": final_logit_calibrator_max_delta_bias,
-            "final_logit_calibrator_supervision_weight": final_logit_calibrator_supervision_weight,
-            "final_logit_calibrator_supervision_loss": final_logit_calibrator_supervision_loss,
-            "final_logit_calibrator_supervision_max_delta_bias": final_logit_calibrator_supervision_max_delta_bias,
-            "final_logit_calibrator_oracle_thresholds": final_logit_oracle_thresholds,
-            "final_logit_calibrator_oracle_min_threshold": final_logit_calibrator_oracle_min_threshold,
-            "final_logit_calibrator_oracle_max_threshold": final_logit_calibrator_oracle_max_threshold,
-            "final_logit_calibrator_oracle_false_positive_penalty": final_logit_calibrator_oracle_false_positive_penalty,
-            "final_logit_calibrator_oracle_area_penalty": final_logit_calibrator_oracle_area_penalty,
-            "final_logit_spatial_supervision_weight": final_logit_spatial_supervision_weight,
-            "final_logit_spatial_supervision_loss": final_logit_spatial_supervision_loss,
-            "final_logit_spatial_supervision_target_scale": final_logit_spatial_supervision_target_scale,
-            "final_logit_spatial_supervision_target_mode": final_logit_spatial_supervision_target_mode,
-            "final_logit_spatial_supervision_hard_threshold": final_logit_spatial_supervision_hard_threshold,
-            "coarse_prompt_refiner": coarse_prompt_refiner,
-            "coarse_prompt_refiner_hidden": coarse_prompt_refiner_hidden,
-            "coarse_prompt_refiner_max_residual": coarse_prompt_refiner_max_residual,
-            "coarse_prompt_refiner_gate_init": coarse_prompt_refiner_gate_init,
-            "coarse_prompt_refiner_gate_max": coarse_prompt_refiner_gate_max,
-            "coarse_prompt_refiner_precision_bias": coarse_prompt_refiner_precision_bias,
-            "coarse_prompt_refiner_recall_bias": coarse_prompt_refiner_recall_bias,
-            "coarse_prompt_head": coarse_prompt_head,
-            "coarse_prompt_hidden": coarse_prompt_hidden,
-            "coarse_prompt_dropout": coarse_prompt_dropout,
-            "coarse_prompt_gate_init": coarse_prompt_gate_init,
-            "coarse_prompt_gate_max": coarse_prompt_gate_max,
-            "coarse_prompt_area_bias": coarse_prompt_area_bias,
-            "coarse_prompt_signed_residual_max_delta": coarse_prompt_signed_residual_max_delta,
-            "coarse_prompt_unet_gate_init": coarse_prompt_unet_gate_init,
-            "coarse_prompt_unet_gate_max": coarse_prompt_unet_gate_max,
-            "coarse_prompt_unet_signed_residual_max_delta": coarse_prompt_unet_signed_residual_max_delta,
-            "coarse_prompt_head_lr_multiplier": coarse_prompt_head_lr_multiplier,
-            "dense_prompt_residual_reg_weight": dense_prompt_residual_reg_weight,
-            "dense_prompt_signed_residual_supervision_weight": dense_prompt_signed_residual_supervision_weight,
-            "dense_prompt_signed_residual_target_source": dense_prompt_signed_residual_target_source,
-            "dense_prompt_signed_residual_loss": dense_prompt_signed_residual_loss,
-            "dense_prompt_signed_residual_target_scale": dense_prompt_signed_residual_target_scale,
-            "dense_prompt_signed_residual_target_mode": dense_prompt_signed_residual_target_mode,
-            "dense_prompt_signed_residual_hard_threshold": dense_prompt_signed_residual_hard_threshold,
-            "dense_prompt_signed_residual_use_gate": dense_prompt_signed_residual_use_gate,
-            "dense_prompt_signed_residual_max_gt_area": dense_prompt_signed_residual_max_gt_area,
-            "dense_prompt_unet_identity_weight": dense_prompt_unet_identity_weight,
-            "dense_prompt_unet_identity_loss": dense_prompt_unet_identity_loss,
-            "dense_prompt_unet_residual_supervision_weight": dense_prompt_unet_residual_supervision_weight,
-            "dense_prompt_unet_residual_loss": dense_prompt_unet_residual_loss,
-            "dense_prompt_unet_residual_target_scale": dense_prompt_unet_residual_target_scale,
-            "dense_prompt_unet_residual_target_mode": dense_prompt_unet_residual_target_mode,
-            "dense_prompt_unet_residual_hard_threshold": dense_prompt_unet_residual_hard_threshold,
-            "dense_prompt_unet_residual_use_gate": dense_prompt_unet_residual_use_gate,
-            "dense_prompt_unet_residual_max_gt_area": dense_prompt_unet_residual_max_gt_area,
-        },
-        "training_config": {
-            "img_size": img_size,
-            "lr": lr,
-            "lambda_focal": lambda_focal,
-            "focal_gamma": focal_gamma,
-            "focal_alpha": focal_alpha,
-            "weight_decay": weight_decay,
-            "lambda_iou": lambda_iou,
-            "scheduler_type": scheduler_type,
-            "ema_decay": ema_decay,
-            "resume_checkpoint": resume_checkpoint,
-            "train_force_resize": train_force_resize,
-            "val_force_resize": val_force_resize,
-            "val_manifest": val_manifest,
-            "coarse_loss_weight": coarse_loss_weight,
-            "coarse_dice_weight": coarse_dice_weight,
-            "coarse_prompt_loss_weight": coarse_prompt_loss_weight,
-            "coarse_prompt_dice_weight": coarse_prompt_dice_weight,
-            "coarse_prompt_false_negative_weight": coarse_prompt_false_negative_weight,
-            "coarse_prompt_false_positive_weight": coarse_prompt_false_positive_weight,
-            "coarse_prompt_supervision_source": coarse_prompt_supervision_source,
-            "coarse_prompt_supervision_max_gt_area": coarse_prompt_supervision_max_gt_area,
-            "prompt_gate_supervision_weight": prompt_gate_supervision_weight,
-            "prompt_gate_target_source": prompt_gate_target_source,
-            "prompt_gate_target_mode": prompt_gate_target_mode,
-            "prompt_gate_sources": prompt_gate_sources,
-            "prompt_gate_loss": prompt_gate_loss,
-            "dual_branch_prompt_gate_supervision_weight": dual_branch_prompt_gate_supervision_weight,
-            "dual_branch_prompt_gate_target_source": dual_branch_prompt_gate_target_source,
-            "dual_branch_prompt_gate_target_mode": dual_branch_prompt_gate_target_mode,
-            "dual_branch_prompt_gate_hard_threshold": dual_branch_prompt_gate_hard_threshold,
-            "dual_branch_prompt_gate_loss": dual_branch_prompt_gate_loss,
-            "dual_branch_prompt_residual_supervision_weight": dual_branch_prompt_residual_supervision_weight,
-            "dual_branch_prompt_residual_target_source": dual_branch_prompt_residual_target_source,
-            "dual_branch_prompt_residual_loss": dual_branch_prompt_residual_loss,
-            "dual_branch_prompt_residual_target_scale": dual_branch_prompt_residual_target_scale,
-            "dual_branch_prompt_residual_target_mode": dual_branch_prompt_residual_target_mode,
-            "dual_branch_prompt_residual_hard_threshold": dual_branch_prompt_residual_hard_threshold,
-            "dual_prompt_fusion_supervision_weight": dual_prompt_fusion_supervision_weight,
-            "dual_prompt_fusion_oracle_metric": dual_prompt_fusion_oracle_metric,
-            "dual_prompt_fusion_loss": dual_prompt_fusion_loss,
-            "adapter_delta_reg_weight": adapter_delta_reg_weight,
-            "coarse_prompt_calibrator_reg_weight": coarse_prompt_calibrator_reg_weight,
-            "prompt_bias_supervision_weight": prompt_bias_supervision_weight,
-            "prompt_bias_supervision_loss": prompt_bias_supervision_loss,
-            "prompt_bias_supervision_max_delta_bias": prompt_bias_supervision_max_delta_bias,
-            "final_logit_calibrator_supervision_weight": final_logit_calibrator_supervision_weight,
-            "final_logit_calibrator_supervision_loss": final_logit_calibrator_supervision_loss,
-            "final_logit_calibrator_supervision_max_delta_bias": final_logit_calibrator_supervision_max_delta_bias,
-            "final_logit_calibrator_oracle_thresholds": final_logit_oracle_thresholds,
-            "final_logit_calibrator_oracle_min_threshold": final_logit_calibrator_oracle_min_threshold,
-            "final_logit_calibrator_oracle_max_threshold": final_logit_calibrator_oracle_max_threshold,
-            "final_logit_calibrator_oracle_false_positive_penalty": final_logit_calibrator_oracle_false_positive_penalty,
-            "final_logit_calibrator_oracle_area_penalty": final_logit_calibrator_oracle_area_penalty,
-            "final_logit_spatial_supervision_weight": final_logit_spatial_supervision_weight,
-            "final_logit_spatial_supervision_loss": final_logit_spatial_supervision_loss,
-            "final_logit_spatial_supervision_target_scale": final_logit_spatial_supervision_target_scale,
-            "final_logit_spatial_supervision_target_mode": final_logit_spatial_supervision_target_mode,
-            "final_logit_spatial_supervision_hard_threshold": final_logit_spatial_supervision_hard_threshold,
-            "dense_prompt_residual_reg_weight": dense_prompt_residual_reg_weight,
-            "dense_prompt_signed_residual_supervision_weight": dense_prompt_signed_residual_supervision_weight,
-            "dense_prompt_signed_residual_target_source": dense_prompt_signed_residual_target_source,
-            "dense_prompt_signed_residual_loss": dense_prompt_signed_residual_loss,
-            "dense_prompt_signed_residual_target_scale": dense_prompt_signed_residual_target_scale,
-            "dense_prompt_signed_residual_target_mode": dense_prompt_signed_residual_target_mode,
-            "dense_prompt_signed_residual_hard_threshold": dense_prompt_signed_residual_hard_threshold,
-            "dense_prompt_signed_residual_use_gate": dense_prompt_signed_residual_use_gate,
-            "dense_prompt_signed_residual_max_gt_area": dense_prompt_signed_residual_max_gt_area,
-            "dense_prompt_unet_identity_weight": dense_prompt_unet_identity_weight,
-            "dense_prompt_unet_identity_loss": dense_prompt_unet_identity_loss,
-            "dense_prompt_unet_residual_supervision_weight": dense_prompt_unet_residual_supervision_weight,
-            "dense_prompt_unet_residual_loss": dense_prompt_unet_residual_loss,
-            "dense_prompt_unet_residual_target_scale": dense_prompt_unet_residual_target_scale,
-            "dense_prompt_unet_residual_target_mode": dense_prompt_unet_residual_target_mode,
-            "dense_prompt_unet_residual_hard_threshold": dense_prompt_unet_residual_hard_threshold,
-            "dense_prompt_unet_residual_use_gate": dense_prompt_unet_residual_use_gate,
-            "dense_prompt_unet_residual_max_gt_area": dense_prompt_unet_residual_max_gt_area,
-            "coarse_prompt_calibrator_lr_multiplier": coarse_prompt_calibrator_lr_multiplier,
-            "area_reg_weight": area_reg_weight,
-            "area_reg_target_source": area_reg_target_source,
-            "area_reg_loss": area_reg_loss,
-            "area_reg_apply_to": area_reg_apply_to,
-            "area_reg_constant": area_reg_constant,
-            "area_reg_max_gt_area": area_reg_max_gt_area,
-            "resume_use_ema_weights": resume_use_ema_weights,
-            "reset_best_score": reset_best_score,
-            "reload_diagnostics_batches": reload_diagnostics_batches,
-            "checkpoint_save_mode": checkpoint_save_mode,
-        },
-        "data_config": {
-            "authentic_ratio": authentic_ratio,
-        "authentic_source_dir": authentic_source_dir,
-        },
-        "sam_config": {
-            "sam_backend": sam_backend,
-            "sam_config_file": sam_config,
-            "sam_checkpoint": sam_ckpt,
+    with training_logs(experiment_dir) as writer:
+        if experiment_name != experiment_name_raw:
+            logger.debug("Sanitized experiment name | raw=%s sanitized=%s", experiment_name_raw, experiment_name)
+        # Ferret-SAM doesn't use perturbation streams
+        max_streams = get_max_streams()
+        final_logit_oracle_thresholds = parse_float_list(final_logit_calibrator_oracle_thresholds)
+
+        # Enable detection probe when authentic_ratio > 0
+        use_detection_probe = authentic_ratio > 0.0
+    
+        logger.info("Running experiment: %s", experiment_name)
+        logger.info(
+            "Ferret-SAM configuration | max_streams=%s",
+            max_streams,
+        )
+        logger.info("Authentic ratio: %.3f", authentic_ratio)
+        logger.info("Detection probe enabled: %s", use_detection_probe)
+        logger.info("Freeze adapters: %s", freeze_adapters)
+        logger.info("Freeze Ferret/LAD backbone: %s", freeze_ferret)
+        logger.info("Train only Ferret U-Net residual branch: %s", freeze_ferret_unet_only)
+        logger.info("Adapter residual scale: %.4f", adapter_residual_scale)
+        active_adapter_scales = parse_adapter_scales(adapter_scales)
+        active_adapter_sample_gate_scales = parse_adapter_scales(adapter_sample_gate_scales)
+        logger.info("Adapter type: %s", adapter_type)
+        logger.info("Adapter active scales: %s", active_adapter_scales if active_adapter_scales is not None else "all")
+        logger.info(
+            "Adapter sample gate: enabled=%s scales=%s max_delta=%.3f",
+            adapter_sample_gate,
+            active_adapter_sample_gate_scales if active_adapter_sample_gate_scales is not None else "all",
+            adapter_sample_gate_max_delta,
+        )
+        logger.info("Adapter gamma init: %.6f", adapter_gamma_init)
+        logger.info("Adapter delta regularization weight: %.6f", adapter_delta_reg_weight)
+        logger.info("SAM3 prompt mode: %s", sam3_prompt_mode)
+        logger.info("Forensic operator: %s", forensic_operator)
+        parsed_lad_multi_taus = parse_float_list(lad_multi_taus)
+        logger.info("LAD multi taus: %s", parsed_lad_multi_taus if parsed_lad_multi_taus is not None else "default")
+        logger.info(
+            "Coarse prompt transform: %s scale=%.4f bias=%.4f",
+            coarse_prompt_transform,
+            coarse_prompt_scale,
+            coarse_prompt_bias,
+        )
+        logger.info(
+            "Coarse prompt calibrator: %s hidden=%s max_delta_scale=%.4f max_delta_bias=%.4f reg_weight=%.6f",
+            coarse_prompt_calibrator,
+            coarse_prompt_calibrator_hidden,
+            coarse_prompt_calibrator_max_delta_scale,
+            coarse_prompt_calibrator_max_delta_bias,
+            coarse_prompt_calibrator_reg_weight,
+        )
+        logger.info(
+            "Coarse prompt calibrator LR multiplier: %.4f",
+            coarse_prompt_calibrator_lr_multiplier,
+        )
+        logger.info(
+            "Prompt bias oracle supervision | weight=%.6f loss=%s max_delta_bias=%s",
+            prompt_bias_supervision_weight,
+            prompt_bias_supervision_loss,
+            prompt_bias_supervision_max_delta_bias,
+        )
+        logger.info(
+            "Final logit calibrator: %s hidden=%s max_delta_scale=%.4f max_delta_bias=%.4f supervision_weight=%.6f loss=%s supervision_max_delta_bias=%s oracle_thresholds=%s oracle_min=%s oracle_max=%s oracle_fp_penalty=%.4f oracle_area_penalty=%.4f",
+            final_logit_calibrator,
+            final_logit_calibrator_hidden,
+            final_logit_calibrator_max_delta_scale,
+            final_logit_calibrator_max_delta_bias,
+            final_logit_calibrator_supervision_weight,
+            final_logit_calibrator_supervision_loss,
+            final_logit_calibrator_supervision_max_delta_bias,
+            final_logit_oracle_thresholds,
+            final_logit_calibrator_oracle_min_threshold,
+            final_logit_calibrator_oracle_max_threshold,
+            final_logit_calibrator_oracle_false_positive_penalty,
+            final_logit_calibrator_oracle_area_penalty,
+        )
+        logger.info(
+            "Final logit spatial supervision | weight=%.6f loss=%s target_scale=%.4f target_mode=%s hard_threshold=%.4f",
+            final_logit_spatial_supervision_weight,
+            final_logit_spatial_supervision_loss,
+            final_logit_spatial_supervision_target_scale,
+            final_logit_spatial_supervision_target_mode,
+            final_logit_spatial_supervision_hard_threshold,
+        )
+        logger.info(
+            "Coarse prompt refiner: %s hidden=%s max_residual=%.4f gate_init=%.4f gate_max=%.4f precision_bias=%.4f recall_bias=%.4f",
+            coarse_prompt_refiner,
+            coarse_prompt_refiner_hidden,
+            coarse_prompt_refiner_max_residual,
+            coarse_prompt_refiner_gate_init,
+            coarse_prompt_refiner_gate_max,
+            coarse_prompt_refiner_precision_bias,
+            coarse_prompt_refiner_recall_bias,
+        )
+        logger.info(
+            "Coarse prompt U-Net residual scales: gate_init=%s gate_max=%s max_delta=%s",
+            coarse_prompt_unet_gate_init if coarse_prompt_unet_gate_init is not None else coarse_prompt_gate_init,
+            coarse_prompt_unet_gate_max if coarse_prompt_unet_gate_max is not None else coarse_prompt_gate_max,
+            (
+                coarse_prompt_unet_signed_residual_max_delta
+                if coarse_prompt_unet_signed_residual_max_delta is not None
+                else coarse_prompt_signed_residual_max_delta
+            ),
+        )
+        logger.info("Dense prompt residual regularization weight: %.6f", dense_prompt_residual_reg_weight)
+        logger.info("Coarse loss weight: %.4f", coarse_loss_weight)
+        logger.info(
+            "Coarse prompt supervision: source=%s max_gt_area=%s bce_weight=%.4f dice_weight=%.4f fn_weight=%.4f fp_weight=%.4f",
+            coarse_prompt_supervision_source,
+            coarse_prompt_supervision_max_gt_area,
+            coarse_prompt_loss_weight,
+            coarse_prompt_dice_weight,
+            coarse_prompt_false_negative_weight,
+            coarse_prompt_false_positive_weight,
+        )
+        logger.info(
+            "Prompt gate supervision | weight=%.6f source=%s mode=%s gates=%s loss=%s",
+            prompt_gate_supervision_weight,
+            prompt_gate_target_source,
+            prompt_gate_target_mode,
+            prompt_gate_sources,
+            prompt_gate_loss,
+        )
+        logger.info(
+            "Dual-branch prompt gate supervision | weight=%.6f source=%s target_mode=%s hard_threshold=%.3f loss=%s",
+            dual_branch_prompt_gate_supervision_weight,
+            dual_branch_prompt_gate_target_source,
+            dual_branch_prompt_gate_target_mode,
+            dual_branch_prompt_gate_hard_threshold,
+            dual_branch_prompt_gate_loss,
+        )
+        logger.info(
+            "Dual-branch prompt residual supervision | weight=%.6f source=%s loss=%s target_scale=%.4f target_mode=%s hard_threshold=%.3f",
+            dual_branch_prompt_residual_supervision_weight,
+            dual_branch_prompt_residual_target_source,
+            dual_branch_prompt_residual_loss,
+            dual_branch_prompt_residual_target_scale,
+            dual_branch_prompt_residual_target_mode,
+            dual_branch_prompt_residual_hard_threshold,
+        )
+        logger.info(
+            "Dual prompt fusion supervision | weight=%.6f metric=%s loss=%s",
+            dual_prompt_fusion_supervision_weight,
+            dual_prompt_fusion_oracle_metric,
+            dual_prompt_fusion_loss,
+        )
+        logger.info(
+            "Area regularization | weight=%.6f target=%s loss=%s apply_to=%s constant=%.4f max_gt_area=%s",
+            area_reg_weight,
+            area_reg_target_source,
+            area_reg_loss,
+            area_reg_apply_to,
+            area_reg_constant,
+            area_reg_max_gt_area,
+        )
+
+        if authentic_source_dir:
+            logger.info(
+                "authentic_source_dir is ignored; authentic images use each dataset's root/source folder."
+            )
+            authentic_source_dir = None
+
+        # Collect all parameters for saving
+        model_params = {
+            "experiment_name": experiment_name,
+            "model_config": {
+                "prompt_dim": prompt_dim,
+                "downscale": downscale,
+                "train_sam_iou": train_sam_iou,
+                "dropout_rate": dropout_rate,
+                "lad_tau": lad_tau,
+                "lad_multi_taus": parsed_lad_multi_taus,
+                "forensic_operator": forensic_operator,
+                "sam_backend": sam_backend,
+                "freeze_adapters": freeze_adapters,
+                "freeze_ferret": freeze_ferret,
+                "freeze_ferret_unet_only": freeze_ferret_unet_only,
+                "adapter_residual_scale": adapter_residual_scale,
+                "adapter_type": adapter_type,
+                "adapter_scales": active_adapter_scales,
+                "adapter_gamma_init": adapter_gamma_init,
+                "adapter_sample_gate": adapter_sample_gate,
+                "adapter_sample_gate_scales": active_adapter_sample_gate_scales,
+                "adapter_sample_gate_max_delta": adapter_sample_gate_max_delta,
+                "adapter_forensic_source": adapter_forensic_source,
+                "adapter_diagnostics": adapter_diagnostics,
+                "sam3_prompt_mode": sam3_prompt_mode,
+                "coarse_prompt_transform": coarse_prompt_transform,
+                "coarse_prompt_scale": coarse_prompt_scale,
+                "coarse_prompt_bias": coarse_prompt_bias,
+                "coarse_prompt_calibrator": coarse_prompt_calibrator,
+                "coarse_prompt_calibrator_hidden": coarse_prompt_calibrator_hidden,
+                "coarse_prompt_calibrator_max_delta_scale": coarse_prompt_calibrator_max_delta_scale,
+                "coarse_prompt_calibrator_max_delta_bias": coarse_prompt_calibrator_max_delta_bias,
+                "coarse_prompt_calibrator_lr_multiplier": coarse_prompt_calibrator_lr_multiplier,
+                "prompt_bias_supervision_weight": prompt_bias_supervision_weight,
+                "prompt_bias_supervision_loss": prompt_bias_supervision_loss,
+                "prompt_bias_supervision_max_delta_bias": prompt_bias_supervision_max_delta_bias,
+                "final_logit_calibrator": final_logit_calibrator,
+                "final_logit_calibrator_hidden": final_logit_calibrator_hidden,
+                "final_logit_calibrator_max_delta_scale": final_logit_calibrator_max_delta_scale,
+                "final_logit_calibrator_max_delta_bias": final_logit_calibrator_max_delta_bias,
+                "final_logit_calibrator_supervision_weight": final_logit_calibrator_supervision_weight,
+                "final_logit_calibrator_supervision_loss": final_logit_calibrator_supervision_loss,
+                "final_logit_calibrator_supervision_max_delta_bias": final_logit_calibrator_supervision_max_delta_bias,
+                "final_logit_calibrator_oracle_thresholds": final_logit_oracle_thresholds,
+                "final_logit_calibrator_oracle_min_threshold": final_logit_calibrator_oracle_min_threshold,
+                "final_logit_calibrator_oracle_max_threshold": final_logit_calibrator_oracle_max_threshold,
+                "final_logit_calibrator_oracle_false_positive_penalty": final_logit_calibrator_oracle_false_positive_penalty,
+                "final_logit_calibrator_oracle_area_penalty": final_logit_calibrator_oracle_area_penalty,
+                "final_logit_spatial_supervision_weight": final_logit_spatial_supervision_weight,
+                "final_logit_spatial_supervision_loss": final_logit_spatial_supervision_loss,
+                "final_logit_spatial_supervision_target_scale": final_logit_spatial_supervision_target_scale,
+                "final_logit_spatial_supervision_target_mode": final_logit_spatial_supervision_target_mode,
+                "final_logit_spatial_supervision_hard_threshold": final_logit_spatial_supervision_hard_threshold,
+                "coarse_prompt_refiner": coarse_prompt_refiner,
+                "coarse_prompt_refiner_hidden": coarse_prompt_refiner_hidden,
+                "coarse_prompt_refiner_max_residual": coarse_prompt_refiner_max_residual,
+                "coarse_prompt_refiner_gate_init": coarse_prompt_refiner_gate_init,
+                "coarse_prompt_refiner_gate_max": coarse_prompt_refiner_gate_max,
+                "coarse_prompt_refiner_precision_bias": coarse_prompt_refiner_precision_bias,
+                "coarse_prompt_refiner_recall_bias": coarse_prompt_refiner_recall_bias,
+                "coarse_prompt_head": coarse_prompt_head,
+                "coarse_prompt_hidden": coarse_prompt_hidden,
+                "coarse_prompt_dropout": coarse_prompt_dropout,
+                "coarse_prompt_gate_init": coarse_prompt_gate_init,
+                "coarse_prompt_gate_max": coarse_prompt_gate_max,
+                "coarse_prompt_area_bias": coarse_prompt_area_bias,
+                "coarse_prompt_signed_residual_max_delta": coarse_prompt_signed_residual_max_delta,
+                "coarse_prompt_unet_gate_init": coarse_prompt_unet_gate_init,
+                "coarse_prompt_unet_gate_max": coarse_prompt_unet_gate_max,
+                "coarse_prompt_unet_signed_residual_max_delta": coarse_prompt_unet_signed_residual_max_delta,
+                "coarse_prompt_head_lr_multiplier": coarse_prompt_head_lr_multiplier,
+                "dense_prompt_residual_reg_weight": dense_prompt_residual_reg_weight,
+                "dense_prompt_signed_residual_supervision_weight": dense_prompt_signed_residual_supervision_weight,
+                "dense_prompt_signed_residual_target_source": dense_prompt_signed_residual_target_source,
+                "dense_prompt_signed_residual_loss": dense_prompt_signed_residual_loss,
+                "dense_prompt_signed_residual_target_scale": dense_prompt_signed_residual_target_scale,
+                "dense_prompt_signed_residual_target_mode": dense_prompt_signed_residual_target_mode,
+                "dense_prompt_signed_residual_hard_threshold": dense_prompt_signed_residual_hard_threshold,
+                "dense_prompt_signed_residual_use_gate": dense_prompt_signed_residual_use_gate,
+                "dense_prompt_signed_residual_max_gt_area": dense_prompt_signed_residual_max_gt_area,
+                "dense_prompt_unet_identity_weight": dense_prompt_unet_identity_weight,
+                "dense_prompt_unet_identity_loss": dense_prompt_unet_identity_loss,
+                "dense_prompt_unet_residual_supervision_weight": dense_prompt_unet_residual_supervision_weight,
+                "dense_prompt_unet_residual_loss": dense_prompt_unet_residual_loss,
+                "dense_prompt_unet_residual_target_scale": dense_prompt_unet_residual_target_scale,
+                "dense_prompt_unet_residual_target_mode": dense_prompt_unet_residual_target_mode,
+                "dense_prompt_unet_residual_hard_threshold": dense_prompt_unet_residual_hard_threshold,
+                "dense_prompt_unet_residual_use_gate": dense_prompt_unet_residual_use_gate,
+                "dense_prompt_unet_residual_max_gt_area": dense_prompt_unet_residual_max_gt_area,
+            },
+            "training_config": {
+                "img_size": img_size,
+                "lr": lr,
+                "lambda_focal": lambda_focal,
+                "focal_gamma": focal_gamma,
+                "focal_alpha": focal_alpha,
+                "weight_decay": weight_decay,
+                "lambda_iou": lambda_iou,
+                "scheduler_type": scheduler_type,
+                "ema_decay": ema_decay,
+                "resume_checkpoint": resume_checkpoint,
+                "train_force_resize": train_force_resize,
+                "val_force_resize": val_force_resize,
+                "val_manifest": val_manifest,
+                "coarse_loss_weight": coarse_loss_weight,
+                "coarse_dice_weight": coarse_dice_weight,
+                "coarse_prompt_loss_weight": coarse_prompt_loss_weight,
+                "coarse_prompt_dice_weight": coarse_prompt_dice_weight,
+                "coarse_prompt_false_negative_weight": coarse_prompt_false_negative_weight,
+                "coarse_prompt_false_positive_weight": coarse_prompt_false_positive_weight,
+                "coarse_prompt_supervision_source": coarse_prompt_supervision_source,
+                "coarse_prompt_supervision_max_gt_area": coarse_prompt_supervision_max_gt_area,
+                "prompt_gate_supervision_weight": prompt_gate_supervision_weight,
+                "prompt_gate_target_source": prompt_gate_target_source,
+                "prompt_gate_target_mode": prompt_gate_target_mode,
+                "prompt_gate_sources": prompt_gate_sources,
+                "prompt_gate_loss": prompt_gate_loss,
+                "dual_branch_prompt_gate_supervision_weight": dual_branch_prompt_gate_supervision_weight,
+                "dual_branch_prompt_gate_target_source": dual_branch_prompt_gate_target_source,
+                "dual_branch_prompt_gate_target_mode": dual_branch_prompt_gate_target_mode,
+                "dual_branch_prompt_gate_hard_threshold": dual_branch_prompt_gate_hard_threshold,
+                "dual_branch_prompt_gate_loss": dual_branch_prompt_gate_loss,
+                "dual_branch_prompt_residual_supervision_weight": dual_branch_prompt_residual_supervision_weight,
+                "dual_branch_prompt_residual_target_source": dual_branch_prompt_residual_target_source,
+                "dual_branch_prompt_residual_loss": dual_branch_prompt_residual_loss,
+                "dual_branch_prompt_residual_target_scale": dual_branch_prompt_residual_target_scale,
+                "dual_branch_prompt_residual_target_mode": dual_branch_prompt_residual_target_mode,
+                "dual_branch_prompt_residual_hard_threshold": dual_branch_prompt_residual_hard_threshold,
+                "dual_prompt_fusion_supervision_weight": dual_prompt_fusion_supervision_weight,
+                "dual_prompt_fusion_oracle_metric": dual_prompt_fusion_oracle_metric,
+                "dual_prompt_fusion_loss": dual_prompt_fusion_loss,
+                "adapter_delta_reg_weight": adapter_delta_reg_weight,
+                "coarse_prompt_calibrator_reg_weight": coarse_prompt_calibrator_reg_weight,
+                "prompt_bias_supervision_weight": prompt_bias_supervision_weight,
+                "prompt_bias_supervision_loss": prompt_bias_supervision_loss,
+                "prompt_bias_supervision_max_delta_bias": prompt_bias_supervision_max_delta_bias,
+                "final_logit_calibrator_supervision_weight": final_logit_calibrator_supervision_weight,
+                "final_logit_calibrator_supervision_loss": final_logit_calibrator_supervision_loss,
+                "final_logit_calibrator_supervision_max_delta_bias": final_logit_calibrator_supervision_max_delta_bias,
+                "final_logit_calibrator_oracle_thresholds": final_logit_oracle_thresholds,
+                "final_logit_calibrator_oracle_min_threshold": final_logit_calibrator_oracle_min_threshold,
+                "final_logit_calibrator_oracle_max_threshold": final_logit_calibrator_oracle_max_threshold,
+                "final_logit_calibrator_oracle_false_positive_penalty": final_logit_calibrator_oracle_false_positive_penalty,
+                "final_logit_calibrator_oracle_area_penalty": final_logit_calibrator_oracle_area_penalty,
+                "final_logit_spatial_supervision_weight": final_logit_spatial_supervision_weight,
+                "final_logit_spatial_supervision_loss": final_logit_spatial_supervision_loss,
+                "final_logit_spatial_supervision_target_scale": final_logit_spatial_supervision_target_scale,
+                "final_logit_spatial_supervision_target_mode": final_logit_spatial_supervision_target_mode,
+                "final_logit_spatial_supervision_hard_threshold": final_logit_spatial_supervision_hard_threshold,
+                "dense_prompt_residual_reg_weight": dense_prompt_residual_reg_weight,
+                "dense_prompt_signed_residual_supervision_weight": dense_prompt_signed_residual_supervision_weight,
+                "dense_prompt_signed_residual_target_source": dense_prompt_signed_residual_target_source,
+                "dense_prompt_signed_residual_loss": dense_prompt_signed_residual_loss,
+                "dense_prompt_signed_residual_target_scale": dense_prompt_signed_residual_target_scale,
+                "dense_prompt_signed_residual_target_mode": dense_prompt_signed_residual_target_mode,
+                "dense_prompt_signed_residual_hard_threshold": dense_prompt_signed_residual_hard_threshold,
+                "dense_prompt_signed_residual_use_gate": dense_prompt_signed_residual_use_gate,
+                "dense_prompt_signed_residual_max_gt_area": dense_prompt_signed_residual_max_gt_area,
+                "dense_prompt_unet_identity_weight": dense_prompt_unet_identity_weight,
+                "dense_prompt_unet_identity_loss": dense_prompt_unet_identity_loss,
+                "dense_prompt_unet_residual_supervision_weight": dense_prompt_unet_residual_supervision_weight,
+                "dense_prompt_unet_residual_loss": dense_prompt_unet_residual_loss,
+                "dense_prompt_unet_residual_target_scale": dense_prompt_unet_residual_target_scale,
+                "dense_prompt_unet_residual_target_mode": dense_prompt_unet_residual_target_mode,
+                "dense_prompt_unet_residual_hard_threshold": dense_prompt_unet_residual_hard_threshold,
+                "dense_prompt_unet_residual_use_gate": dense_prompt_unet_residual_use_gate,
+                "dense_prompt_unet_residual_max_gt_area": dense_prompt_unet_residual_max_gt_area,
+                "coarse_prompt_calibrator_lr_multiplier": coarse_prompt_calibrator_lr_multiplier,
+                "area_reg_weight": area_reg_weight,
+                "area_reg_target_source": area_reg_target_source,
+                "area_reg_loss": area_reg_loss,
+                "area_reg_apply_to": area_reg_apply_to,
+                "area_reg_constant": area_reg_constant,
+                "area_reg_max_gt_area": area_reg_max_gt_area,
+                "resume_use_ema_weights": resume_use_ema_weights,
+                "reset_best_score": reset_best_score,
+                "reload_diagnostics_batches": reload_diagnostics_batches,
+                "checkpoint_save_mode": checkpoint_save_mode,
+            },
+            "data_config": {
+                "authentic_ratio": authentic_ratio,
+            "authentic_source_dir": authentic_source_dir,
+            },
+            "sam_config": {
+                "sam_backend": sam_backend,
+                "sam_config_file": sam_config,
+                "sam_checkpoint": sam_ckpt,
+            }
         }
-    }
     
-    # Save parameters to JSON file
-    params_save_path = os.path.join(experiment_dir, "model_params.json")
-    with open(params_save_path, 'w') as f:
-        json.dump(model_params, f, indent=2)
-    logger.info("Model parameters saved to %s", params_save_path)
+        # Save parameters to JSON file
+        params_save_path = os.path.join(experiment_dir, "model_params.json")
+        with open(params_save_path, 'w') as f:
+            json.dump(model_params, f, indent=2)
+        logger.info("Model parameters saved to %s", params_save_path)
+        writer.add_text("Configuration/model", f"```json\n{json.dumps(model_params, indent=2)}\n```", 0)
     
-    # Update save path to be under experiment directory
-    model_save_path = os.path.join(experiment_dir, "best_model.pth")
+        # Update save path to be under experiment directory
+        model_save_path = os.path.join(experiment_dir, "best_model.pth")
 
-    # Load dataset configuration and create datasets
-    try:
-        # Use default config path if not specified
-        if dataset_config is None:
-            dataset_config = os.path.join(os.path.dirname(__file__), "configs/datasets_default.json")
+        # Load dataset configuration and create datasets
+        try:
+            # Use default config path if not specified
+            if dataset_config is None:
+                dataset_config = os.path.join(os.path.dirname(__file__), "configs/datasets_default.json")
             
-        if os.path.exists(dataset_config):
-            dataset_manager_config = load_dataset_config(dataset_config)
-            logger.info("Loaded dataset configuration from %s", dataset_config)
-        else:
-            logger.warning("Dataset config file %s not found, using default configuration", dataset_config)
+            if os.path.exists(dataset_config):
+                dataset_manager_config = load_dataset_config(dataset_config)
+                logger.info("Loaded dataset configuration from %s", dataset_config)
+            else:
+                logger.warning("Dataset config file %s not found, using default configuration", dataset_config)
+                dataset_manager_config = create_default_config()
+        except Exception as e:
+            logger.warning("Failed to load dataset config: %s. Using default configuration.", e)
             dataset_manager_config = create_default_config()
-    except Exception as e:
-        logger.warning("Failed to load dataset config: %s. Using default configuration.", e)
-        dataset_manager_config = create_default_config()
     
-    # Override batch size from command line args
-    dataset_manager_config.train_loader.batch_size = args.batch_size
+        # Override batch size from command line args
+        dataset_manager_config.train_loader.batch_size = args.batch_size
     
-    dataset_manager = DatasetManager(dataset_manager_config)
+        dataset_manager = DatasetManager(dataset_manager_config)
     
-    # Create training datasets
-    train_dataset, train_loader = dataset_manager.create_train_datasets(
-        img_size=img_size,
-        contrastive_blur=False,
-        perturbation_type="gaussian_blur/gaussian_noise",
-        perturbation_intensity=0.75,
-        authentic_ratio=authentic_ratio,
-        force_resize=train_force_resize,
-    )
-    
-    validation_manifest = load_validation_manifest(val_manifest) if val_manifest else None
-    if validation_manifest is not None:
-        logger.info("Loaded fixed validation manifest from %s", val_manifest)
-
-    # Create validation datasets
-    val_dataset, val_loader = dataset_manager.create_val_datasets(
-        img_size=img_size,
-        contrastive_blur=False,
-        perturbation_type="gaussian_blur/gaussian_noise",
-        perturbation_intensity=0.75,
-        authentic_ratio=authentic_ratio,
-        force_resize=val_force_resize,
-        validation_manifest=validation_manifest,
-    )
-    
-    # Log dataset information
-    logger.info(
-        "Training samples=%s validation_samples=%s",
-        len(train_dataset),
-        len(val_dataset) if val_dataset else 0,
-    )
-    checkpoint_data: Optional[Dict[str, Any]] = None
-    if resume_checkpoint:
-        if os.path.exists(resume_checkpoint):
-            logger.info("Loading checkpoint from %s", resume_checkpoint)
-            # Keep resumed checkpoints on CPU until tensors are selectively
-            # copied into the model.  Loading a full SAM checkpoint directly
-            # to CUDA duplicates several GB of weights before model
-            # construction and makes concurrent diagnostics unnecessarily
-            # fragile.
-            checkpoint_data = torch.load(resume_checkpoint, map_location="cpu", weights_only=False)
-            logger.info(
-                "Checkpoint metadata | epoch=%s score=%s",
-                checkpoint_data.get("epoch"),
-                checkpoint_data.get("score"),
-            )
-        else:
-            logger.warning("Checkpoint %s not found; starting from scratch", resume_checkpoint)
-    # Initialize Ferret-SAM model
-    model = ForgeryLocalizer(
-        sam_config=sam_config,
-        sam_checkpoint=sam_ckpt,
-        sam_backend=sam_backend,
-        prompt_dim=prompt_dim,
-        output_resolution=(img_size, img_size),
-        downscale=downscale,
-        train_sam_iou=train_sam_iou,
-        dropout_rate=dropout_rate,
-        lad_tau=lad_tau,
-        lad_multi_taus=parsed_lad_multi_taus,
-        forensic_operator=forensic_operator,
-        use_detection_probe=use_detection_probe,  # Enable based on authentic_ratio
-        adapter_residual_scale=adapter_residual_scale,
-        adapter_type=adapter_type,
-        adapter_active_scales=active_adapter_scales,
-        adapter_gamma_init=adapter_gamma_init,
-        adapter_sample_gate=adapter_sample_gate,
-        adapter_sample_gate_scales=active_adapter_sample_gate_scales,
-        adapter_sample_gate_max_delta=adapter_sample_gate_max_delta,
-        adapter_forensic_source=adapter_forensic_source,
-        adapter_diagnostics=adapter_diagnostics or adapter_delta_reg_weight > 0.0,
-        sam3_prompt_mode=sam3_prompt_mode,
-        coarse_prompt_transform=coarse_prompt_transform,
-        coarse_prompt_scale=coarse_prompt_scale,
-        coarse_prompt_bias=coarse_prompt_bias,
-        coarse_prompt_calibrator=coarse_prompt_calibrator,
-        coarse_prompt_calibrator_hidden=coarse_prompt_calibrator_hidden,
-        coarse_prompt_calibrator_max_delta_scale=coarse_prompt_calibrator_max_delta_scale,
-        coarse_prompt_calibrator_max_delta_bias=coarse_prompt_calibrator_max_delta_bias,
-        final_logit_calibrator=final_logit_calibrator,
-        final_logit_calibrator_hidden=final_logit_calibrator_hidden,
-        final_logit_calibrator_max_delta_scale=final_logit_calibrator_max_delta_scale,
-        final_logit_calibrator_max_delta_bias=final_logit_calibrator_max_delta_bias,
-        coarse_prompt_refiner=coarse_prompt_refiner,
-        coarse_prompt_refiner_hidden=coarse_prompt_refiner_hidden,
-        coarse_prompt_refiner_max_residual=coarse_prompt_refiner_max_residual,
-        coarse_prompt_refiner_gate_init=coarse_prompt_refiner_gate_init,
-        coarse_prompt_refiner_gate_max=coarse_prompt_refiner_gate_max,
-        coarse_prompt_refiner_precision_bias=coarse_prompt_refiner_precision_bias,
-        coarse_prompt_refiner_recall_bias=coarse_prompt_refiner_recall_bias,
-        coarse_prompt_head=coarse_prompt_head,
-        coarse_prompt_hidden=coarse_prompt_hidden,
-        coarse_prompt_dropout=coarse_prompt_dropout,
-        coarse_prompt_gate_init=coarse_prompt_gate_init,
-        coarse_prompt_gate_max=coarse_prompt_gate_max,
-        coarse_prompt_area_bias=coarse_prompt_area_bias,
-        coarse_prompt_signed_residual_max_delta=coarse_prompt_signed_residual_max_delta,
-        coarse_prompt_unet_gate_init=coarse_prompt_unet_gate_init,
-        coarse_prompt_unet_gate_max=coarse_prompt_unet_gate_max,
-        coarse_prompt_unet_signed_residual_max_delta=coarse_prompt_unet_signed_residual_max_delta,
-    ).to(device)
-    
-    # Load pretrained FerretNet weights if requested
-    if args.load_ferret_weights:
-        logger.info("Loading pretrained FerretNet weights from %s", args.ferret_weights_path)
-        model.ferret_backbone.load_pretrained_weights(args.ferret_weights_path)
-    
-    if checkpoint_data and "model" in checkpoint_data:
-        load_report = load_matching_state_dict(model, checkpoint_data["model"])
-        logger.info("Loaded %s matching checkpoint tensors into model.", load_report["loaded"])
-        if load_report["missing_keys"]:
-            logger.warning("Missing keys when loading checkpoint: %s", load_report["missing_keys"])
-        if load_report["unexpected_keys"]:
-            logger.warning("Unexpected keys when loading checkpoint: %s", load_report["unexpected_keys"])
-        if load_report["skipped_shape_mismatch"]:
-            logger.warning(
-                "Skipped shape-mismatched checkpoint keys: %s",
-                load_report["skipped_shape_mismatch"],
-            )
-        if load_report.get("adapted_shape_mismatch"):
-            logger.info(
-                "Adapted shape-mismatched checkpoint keys: %s",
-                load_report["adapted_shape_mismatch"],
-            )
-        if resume_use_ema_weights and "ema" in checkpoint_data:
-            loaded_ema = apply_ema_weights_to_model(model, checkpoint_data["ema"])
-            logger.info("Loaded %s matching EMA tensors into model before fine-tuning.", loaded_ema)
-
-    # Freeze SAM components (only train adapters)
-    model.encoder.eval()
-    model.decoder.eval()
-    model.sam_prompt_encoder.eval()
-    
-    # Freeze only the preloaded parts of FerretBackbone, leave MLDC trainable
-    # model.ferret_backbone.eval()
-    
-    # # Fix running_var values in FerretBackbone after setting to eval mode
-    # print(f"\n=== Post-Initialization RunningVar Fix ===")
-    # fixed_count = 0
-    # for name, module in model.ferret_backbone.named_modules():
-    #     if isinstance(module, nn.BatchNorm2d) and hasattr(module, 'running_var'):
-    #         # Check if any running_var is too small
-    #         if (module.running_var < 1e-6).any():
-    #             # Set minimum value to 1e-6
-    #             module.running_var = torch.clamp(module.running_var, min=1e-6)
-    #             fixed_count += 1
-    #             print(f"  Fixed running_var in {name}")
-    # if fixed_count > 0:
-    #     print(f"  Total fixed: {fixed_count} BatchNorm2d layers")
-    # else:
-    #     print(f"  No running_var values needed fixing")
-    
-    # Recalibrate BN statistics using current dataset
-    # def recalibrate_bn(model, dataloader, device, num_batches=50):
-    #     """
-    #     仅用于修复冻结层中损坏的 BN 统计量。
-    #     """
-    #     print("\n=== 开始重新校准 BatchNorm 统计量 ===")
-        
-    #     # 1. 强制让 Backbone 处于 Train 模式
-    #     # 这会开启 BN 层的统计量更新 (track_running_stats=True)
-    #     model.ferret_backbone.train()
-        
-    #     # 2. 确保不需要梯度（因为我们只更新统计量，不更新权重）
-    #     model.ferret_backbone.requires_grad_(False)
-        
-    #     with torch.no_grad():
-    #         for i, batch in enumerate(dataloader):
-    #             if i >= num_batches: break # 跑几十个 Batch 就足够收敛了
-                
-    #             # 3. 准备数据
-    #             images = batch['orig'].to(device, non_blocking=True)
-                
-    #             # 4. 前向传播
-    #             # 这一步会自动更新 model.ferret_backbone 里所有 BN 层的 running_mean/var
-    #             _ = model.ferret_backbone(images)
-                
-    #             if i % 10 == 0:
-    #                 print(f"  校准进度: {i}/{num_batches}")
-    
-    #     # 5. 校准完成，切回 Eval 模式（冻结行为）
-    #     model.ferret_backbone.eval()
-    #     print("=== 校准完成！BN 统计量已修复为当前数据的真实分布 ===")
-    
-    # # 使用当前的 train_loader 校准 BN 统计量
-    # recalibrate_bn(model, train_loader, device, num_batches=50)
-    
-    # # Freeze all parameters first
-    # for p in model.ferret_backbone.parameters():
-    #     p.requires_grad = False
-    
-    # # Make MLDC parameters trainable since they're not from preloaded weights
-    # for p in model.ferret_backbone.mldc.parameters():
-    #     p.requires_grad = True
-
-    # Setup trainable parameters
-    trainable_params = collect_trainable_params(
-        model,
-        freeze_adapters=freeze_adapters,
-        freeze_ferret=freeze_ferret,
-        freeze_ferret_unet_only=freeze_ferret_unet_only,
-    )
-            
-    # Initialize optimizer
-    optimizer = torch.optim.AdamW(
-        build_optimizer_param_groups(
-            model,
-            trainable_params,
-            base_lr=lr,
-            prompt_calibrator_lr_multiplier=coarse_prompt_calibrator_lr_multiplier,
-            coarse_prompt_head_lr_multiplier=coarse_prompt_head_lr_multiplier,
-        ),
-        lr=lr,
-        weight_decay=weight_decay,
-    )
-    
-    # Create learning rate scheduler
-    if scheduler_type == "onecycle":
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=args.lr,
-            steps_per_epoch=len(train_loader),
-            epochs=args.epochs,
-            div_factor=25,  # Increased div_factor for more gradual warmup
-            final_div_factor=100,  # Increased final_div_factor for smoother decay
-            pct_start=0.3,  # Increased warmup to 30% of epochs
-            anneal_strategy="cos",
+        # Create training datasets
+        train_dataset, train_loader = dataset_manager.create_train_datasets(
+            img_size=img_size,
+            contrastive_blur=False,
+            perturbation_type="gaussian_blur/gaussian_noise",
+            perturbation_intensity=0.75,
+            authentic_ratio=authentic_ratio,
+            force_resize=train_force_resize,
         )
-    elif scheduler_type == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=args.epochs,
-            eta_min=lr * 0.001  # Lower minimum learning rate
+    
+        validation_manifest = load_validation_manifest(val_manifest) if val_manifest else None
+        if validation_manifest is not None:
+            logger.info("Loaded fixed validation manifest from %s", val_manifest)
+
+        # Create validation datasets
+        val_dataset, val_loader = dataset_manager.create_val_datasets(
+            img_size=img_size,
+            contrastive_blur=False,
+            perturbation_type="gaussian_blur/gaussian_noise",
+            perturbation_intensity=0.75,
+            authentic_ratio=authentic_ratio,
+            force_resize=val_force_resize,
+            validation_manifest=validation_manifest,
         )
-    elif scheduler_type == "none":
-        scheduler = None
-    else:
-        raise ValueError(f"Unknown scheduler type: {scheduler_type}")
-
-    # Initialize EMA
-    ema = EMA(model, decay=ema_decay)
-    if checkpoint_data and "ema" in checkpoint_data:
-        ema.load_state_dict(checkpoint_data["ema"])
-        logger.info("Loaded EMA weights from checkpoint.")
-
-    # Initialize training state
-    best_score = 0.0 if reset_best_score else (checkpoint_data.get("score", 0.0) if checkpoint_data else 0.0)
-    if reset_best_score and checkpoint_data:
-        logger.info("Reset best_score to 0.0 for resumed run checkpoint selection.")
-    start_epoch = checkpoint_data.get("epoch", 0) + 1 if checkpoint_data else 1
-
-    # Initialize metrics history for tracking
-    metrics_history = {
-        'train_losses': [], 'val_ious': [], 'val_f1s': [],
-        'small_iou': [], 'medium_iou': [], 'large_iou': [],
-        'small_f1': [], 'medium_f1': [], 'large_f1': [],
-        'small_count': [], 'medium_count': [], 'large_count': [],
-        'dataset_metrics': {},
-        'dataset_size_metrics': {},  # NEW: Add dataset-specific size metrics
-        'train_iou': [], 'val_iou_epoch': [], 'iou_divergence': []
-    }
-
-    # Training loop
-    for epoch in range(start_epoch, args.epochs + 1):
-        loss_list, val_metrics_list, best_score, train_ious = train_epoch(
-            model=model,
-            loader=train_loader,
-            optimizer=optimizer,
-            device=device,
-            scheduler=scheduler,
-            val_loader=val_loader,
-            validate_fn=validate,
-            epoch=epoch,
-            total_epochs=args.epochs,
-            val_steps=val_steps,
-            lambda_focal=lambda_focal,
-            focal_gamma=focal_gamma,
-            focal_alpha=focal_alpha,
-            model_save_path=model_save_path,
-            best_score=best_score,
-            ema=ema,
-            lambda_iou=lambda_iou,
-            train_sam_iou=train_sam_iou,
-            model_params=model_params,
-            authentic_ratio=authentic_ratio,  # Pass authentic_ratio
-            lambda_detection=lambda_detection,  # Pass detection loss weight
-            coarse_loss_weight=coarse_loss_weight,
-            coarse_dice_weight=coarse_dice_weight,
-            adapter_delta_reg_weight=adapter_delta_reg_weight,
-            coarse_prompt_calibrator_reg_weight=coarse_prompt_calibrator_reg_weight,
-            prompt_bias_supervision_weight=prompt_bias_supervision_weight,
-            prompt_bias_supervision_loss=prompt_bias_supervision_loss,
-            prompt_bias_supervision_max_delta_bias=prompt_bias_supervision_max_delta_bias,
-            final_logit_calibrator_supervision_weight=final_logit_calibrator_supervision_weight,
-            final_logit_calibrator_supervision_loss=final_logit_calibrator_supervision_loss,
-            final_logit_calibrator_supervision_max_delta_bias=final_logit_calibrator_supervision_max_delta_bias,
-            final_logit_calibrator_oracle_thresholds=final_logit_oracle_thresholds,
-            final_logit_calibrator_oracle_min_threshold=final_logit_calibrator_oracle_min_threshold,
-            final_logit_calibrator_oracle_max_threshold=final_logit_calibrator_oracle_max_threshold,
-            final_logit_calibrator_oracle_false_positive_penalty=final_logit_calibrator_oracle_false_positive_penalty,
-            final_logit_calibrator_oracle_area_penalty=final_logit_calibrator_oracle_area_penalty,
-            final_logit_spatial_supervision_weight=final_logit_spatial_supervision_weight,
-            final_logit_spatial_supervision_loss=final_logit_spatial_supervision_loss,
-            final_logit_spatial_supervision_target_scale=final_logit_spatial_supervision_target_scale,
-            final_logit_spatial_supervision_target_mode=final_logit_spatial_supervision_target_mode,
-            final_logit_spatial_supervision_hard_threshold=final_logit_spatial_supervision_hard_threshold,
-            dense_prompt_residual_reg_weight=dense_prompt_residual_reg_weight,
-            dense_prompt_signed_residual_supervision_weight=dense_prompt_signed_residual_supervision_weight,
-            dense_prompt_signed_residual_target_source=dense_prompt_signed_residual_target_source,
-            dense_prompt_signed_residual_loss=dense_prompt_signed_residual_loss,
-            dense_prompt_signed_residual_target_scale=dense_prompt_signed_residual_target_scale,
-            dense_prompt_signed_residual_target_mode=dense_prompt_signed_residual_target_mode,
-            dense_prompt_signed_residual_hard_threshold=dense_prompt_signed_residual_hard_threshold,
-            dense_prompt_signed_residual_use_gate=dense_prompt_signed_residual_use_gate,
-            dense_prompt_signed_residual_max_gt_area=dense_prompt_signed_residual_max_gt_area,
-            dense_prompt_unet_identity_weight=dense_prompt_unet_identity_weight,
-            dense_prompt_unet_identity_loss=dense_prompt_unet_identity_loss,
-            dense_prompt_unet_residual_supervision_weight=dense_prompt_unet_residual_supervision_weight,
-            dense_prompt_unet_residual_loss=dense_prompt_unet_residual_loss,
-            dense_prompt_unet_residual_target_scale=dense_prompt_unet_residual_target_scale,
-            dense_prompt_unet_residual_target_mode=dense_prompt_unet_residual_target_mode,
-            dense_prompt_unet_residual_hard_threshold=dense_prompt_unet_residual_hard_threshold,
-            dense_prompt_unet_residual_use_gate=dense_prompt_unet_residual_use_gate,
-            dense_prompt_unet_residual_max_gt_area=dense_prompt_unet_residual_max_gt_area,
-            coarse_prompt_loss_weight=coarse_prompt_loss_weight,
-            coarse_prompt_dice_weight=coarse_prompt_dice_weight,
-            coarse_prompt_false_negative_weight=coarse_prompt_false_negative_weight,
-            coarse_prompt_false_positive_weight=coarse_prompt_false_positive_weight,
-            coarse_prompt_supervision_source=coarse_prompt_supervision_source,
-            coarse_prompt_supervision_max_gt_area=coarse_prompt_supervision_max_gt_area,
-            prompt_gate_supervision_weight=prompt_gate_supervision_weight,
-            prompt_gate_target_source=prompt_gate_target_source,
-            prompt_gate_target_mode=prompt_gate_target_mode,
-            prompt_gate_sources=prompt_gate_sources,
-            prompt_gate_loss=prompt_gate_loss,
-            dual_branch_prompt_gate_supervision_weight=dual_branch_prompt_gate_supervision_weight,
-            dual_branch_prompt_gate_target_source=dual_branch_prompt_gate_target_source,
-            dual_branch_prompt_gate_target_mode=dual_branch_prompt_gate_target_mode,
-            dual_branch_prompt_gate_hard_threshold=dual_branch_prompt_gate_hard_threshold,
-            dual_branch_prompt_gate_loss=dual_branch_prompt_gate_loss,
-            dual_branch_prompt_residual_supervision_weight=dual_branch_prompt_residual_supervision_weight,
-            dual_branch_prompt_residual_target_source=dual_branch_prompt_residual_target_source,
-            dual_branch_prompt_residual_loss=dual_branch_prompt_residual_loss,
-            dual_branch_prompt_residual_target_scale=dual_branch_prompt_residual_target_scale,
-            dual_branch_prompt_residual_target_mode=dual_branch_prompt_residual_target_mode,
-            dual_branch_prompt_residual_hard_threshold=dual_branch_prompt_residual_hard_threshold,
-            dual_prompt_fusion_supervision_weight=dual_prompt_fusion_supervision_weight,
-            dual_prompt_fusion_oracle_metric=dual_prompt_fusion_oracle_metric,
-            dual_prompt_fusion_loss=dual_prompt_fusion_loss,
-            prompt_gate_refiner_max=coarse_prompt_refiner_gate_max,
-            prompt_gate_dense_max=coarse_prompt_gate_max,
-            area_reg_weight=area_reg_weight,
-            area_reg_target_source=area_reg_target_source,
-            area_reg_loss=area_reg_loss,
-            area_reg_apply_to=area_reg_apply_to,
-            area_reg_constant=area_reg_constant,
-            area_reg_max_gt_area=area_reg_max_gt_area,
-            reload_diagnostics_batches=reload_diagnostics_batches,
-            checkpoint_save_mode=checkpoint_save_mode,
-        )
-        
-        # Update metrics history
-        metrics_history['train_losses'].extend(loss_list)
-        
-        # Process validation metrics
-        if val_metrics_list:
-            epoch_metrics = aggregate_epoch_metrics(val_metrics_list)
-            
-            # Store overall metrics
-            metrics_history['val_ious'].extend([vm["iou"] for vm in val_metrics_list])
-            metrics_history['val_f1s'].extend([vm["f1"] for vm in val_metrics_list])
-            
-            # Store stratified metrics
-            for size in ['small', 'medium', 'large']:
-                for metric in ['iou', 'f1', 'count']:
-                    key = f'{size}_{metric}'
-                    metrics_history[key].append(epoch_metrics.get(key, 0.0))
-            
-            # Store dataset-specific metrics
-            if 'dataset_metrics' in epoch_metrics:
-                for dataset_name, dataset_result in epoch_metrics['dataset_metrics'].items():
-                    if dataset_name not in metrics_history['dataset_metrics']:
-                        metrics_history['dataset_metrics'][dataset_name] = {
-                            'iou_history': [], 'f1_history': [], 'count_history': []
-                        }
-                    
-                    metrics_history['dataset_metrics'][dataset_name]['iou_history'].append(dataset_result['iou'])
-                    metrics_history['dataset_metrics'][dataset_name]['f1_history'].append(dataset_result['f1'])
-                    metrics_history['dataset_metrics'][dataset_name]['count_history'].append(dataset_result['count'])
-            
-            # NEW: Store dataset-specific SIZE metrics
-            if 'dataset_size_metrics' in epoch_metrics:
-                for dataset_name, size_results in epoch_metrics['dataset_size_metrics'].items():
-                    if dataset_name not in metrics_history['dataset_size_metrics']:
-                        metrics_history['dataset_size_metrics'][dataset_name] = {
-                            f'{size}_{metric}_history': []
-                            for size in ['small', 'medium', 'large']
-                            for metric in ['iou', 'f1', 'count']
-                        }
-                    
-                    for size in ['small', 'medium', 'large']:
-                        for metric in ['iou', 'f1', 'count']:
-                            key = f'{size}_{metric}'
-                            history_key = f'{size}_{metric}_history'
-                            value = size_results.get(key, 0.0)
-                            metrics_history['dataset_size_metrics'][dataset_name][history_key].append(value)
-            
-            # Handle IoU tracking
-            if train_ious:
-                epoch_train_iou = np.mean(train_ious)
-                epoch_val_iou = epoch_metrics.get('overall_iou', 0.0)
-                
-                metrics_history['train_iou'].append(epoch_train_iou)
-                metrics_history['val_iou_epoch'].append(epoch_val_iou)
-                metrics_history['iou_divergence'].append(epoch_train_iou - epoch_val_iou)
-                
-                logger.info(
-                    "Epoch %s IoU | train=%.4f val=%.4f divergence=%.4f",
-                    epoch,
-                    epoch_train_iou,
-                    epoch_val_iou,
-                    epoch_train_iou - epoch_val_iou,
-                )
-        
-        # Generate metrics visualization
+    
+        # Log dataset information
         logger.info(
-            "Epoch %s completed. Saving metrics visualization at %s",
-            epoch,
-            os.path.join(experiment_dir, 'metrics.png'),
+            "Training samples=%s validation_samples=%s",
+            len(train_dataset),
+            len(val_dataset) if val_dataset else 0,
         )
-        plot_all_metrics(
-            metrics_history, 
-            True, 
-            save_path=os.path.join(experiment_dir, "metrics.png")
+        checkpoint_data: Optional[Dict[str, Any]] = None
+        if resume_checkpoint:
+            if os.path.exists(resume_checkpoint):
+                logger.info("Loading checkpoint from %s", resume_checkpoint)
+                # Keep resumed checkpoints on CPU until tensors are selectively
+                # copied into the model.  Loading a full SAM checkpoint directly
+                # to CUDA duplicates several GB of weights before model
+                # construction and makes concurrent diagnostics unnecessarily
+                # fragile.
+                checkpoint_data = torch.load(resume_checkpoint, map_location="cpu", weights_only=False)
+                logger.info(
+                    "Checkpoint metadata | epoch=%s score=%s",
+                    checkpoint_data.get("epoch"),
+                    checkpoint_data.get("score"),
+                )
+            else:
+                logger.warning("Checkpoint %s not found; starting from scratch", resume_checkpoint)
+        # Initialize Ferret-SAM model
+        model = ForgeryLocalizer(
+            sam_config=sam_config,
+            sam_checkpoint=sam_ckpt,
+            sam_backend=sam_backend,
+            prompt_dim=prompt_dim,
+            output_resolution=(img_size, img_size),
+            downscale=downscale,
+            train_sam_iou=train_sam_iou,
+            dropout_rate=dropout_rate,
+            lad_tau=lad_tau,
+            lad_multi_taus=parsed_lad_multi_taus,
+            forensic_operator=forensic_operator,
+            use_detection_probe=use_detection_probe,  # Enable based on authentic_ratio
+            adapter_residual_scale=adapter_residual_scale,
+            adapter_type=adapter_type,
+            adapter_active_scales=active_adapter_scales,
+            adapter_gamma_init=adapter_gamma_init,
+            adapter_sample_gate=adapter_sample_gate,
+            adapter_sample_gate_scales=active_adapter_sample_gate_scales,
+            adapter_sample_gate_max_delta=adapter_sample_gate_max_delta,
+            adapter_forensic_source=adapter_forensic_source,
+            adapter_diagnostics=adapter_diagnostics or adapter_delta_reg_weight > 0.0,
+            sam3_prompt_mode=sam3_prompt_mode,
+            coarse_prompt_transform=coarse_prompt_transform,
+            coarse_prompt_scale=coarse_prompt_scale,
+            coarse_prompt_bias=coarse_prompt_bias,
+            coarse_prompt_calibrator=coarse_prompt_calibrator,
+            coarse_prompt_calibrator_hidden=coarse_prompt_calibrator_hidden,
+            coarse_prompt_calibrator_max_delta_scale=coarse_prompt_calibrator_max_delta_scale,
+            coarse_prompt_calibrator_max_delta_bias=coarse_prompt_calibrator_max_delta_bias,
+            final_logit_calibrator=final_logit_calibrator,
+            final_logit_calibrator_hidden=final_logit_calibrator_hidden,
+            final_logit_calibrator_max_delta_scale=final_logit_calibrator_max_delta_scale,
+            final_logit_calibrator_max_delta_bias=final_logit_calibrator_max_delta_bias,
+            coarse_prompt_refiner=coarse_prompt_refiner,
+            coarse_prompt_refiner_hidden=coarse_prompt_refiner_hidden,
+            coarse_prompt_refiner_max_residual=coarse_prompt_refiner_max_residual,
+            coarse_prompt_refiner_gate_init=coarse_prompt_refiner_gate_init,
+            coarse_prompt_refiner_gate_max=coarse_prompt_refiner_gate_max,
+            coarse_prompt_refiner_precision_bias=coarse_prompt_refiner_precision_bias,
+            coarse_prompt_refiner_recall_bias=coarse_prompt_refiner_recall_bias,
+            coarse_prompt_head=coarse_prompt_head,
+            coarse_prompt_hidden=coarse_prompt_hidden,
+            coarse_prompt_dropout=coarse_prompt_dropout,
+            coarse_prompt_gate_init=coarse_prompt_gate_init,
+            coarse_prompt_gate_max=coarse_prompt_gate_max,
+            coarse_prompt_area_bias=coarse_prompt_area_bias,
+            coarse_prompt_signed_residual_max_delta=coarse_prompt_signed_residual_max_delta,
+            coarse_prompt_unet_gate_init=coarse_prompt_unet_gate_init,
+            coarse_prompt_unet_gate_max=coarse_prompt_unet_gate_max,
+            coarse_prompt_unet_signed_residual_max_delta=coarse_prompt_unet_signed_residual_max_delta,
+        ).to(device)
+    
+        # Load pretrained FerretNet weights if requested
+        if args.load_ferret_weights:
+            logger.info("Loading pretrained FerretNet weights from %s", args.ferret_weights_path)
+            model.ferret_backbone.load_pretrained_weights(args.ferret_weights_path)
+    
+        if checkpoint_data and "model" in checkpoint_data:
+            load_report = load_matching_state_dict(model, checkpoint_data["model"])
+            logger.info("Loaded %s matching checkpoint tensors into model.", load_report["loaded"])
+            if load_report["missing_keys"]:
+                logger.warning("Missing keys when loading checkpoint: %s", load_report["missing_keys"])
+            if load_report["unexpected_keys"]:
+                logger.warning("Unexpected keys when loading checkpoint: %s", load_report["unexpected_keys"])
+            if load_report["skipped_shape_mismatch"]:
+                logger.warning(
+                    "Skipped shape-mismatched checkpoint keys: %s",
+                    load_report["skipped_shape_mismatch"],
+                )
+            if load_report.get("adapted_shape_mismatch"):
+                logger.info(
+                    "Adapted shape-mismatched checkpoint keys: %s",
+                    load_report["adapted_shape_mismatch"],
+                )
+            if resume_use_ema_weights and "ema" in checkpoint_data:
+                loaded_ema = apply_ema_weights_to_model(model, checkpoint_data["ema"])
+                logger.info("Loaded %s matching EMA tensors into model before fine-tuning.", loaded_ema)
+
+        # Freeze SAM components (only train adapters)
+        model.encoder.eval()
+        model.decoder.eval()
+        model.sam_prompt_encoder.eval()
+    
+        # Freeze only the preloaded parts of FerretBackbone, leave MLDC trainable
+        # model.ferret_backbone.eval()
+    
+        # # Fix running_var values in FerretBackbone after setting to eval mode
+        # print(f"\n=== Post-Initialization RunningVar Fix ===")
+        # fixed_count = 0
+        # for name, module in model.ferret_backbone.named_modules():
+        #     if isinstance(module, nn.BatchNorm2d) and hasattr(module, 'running_var'):
+        #         # Check if any running_var is too small
+        #         if (module.running_var < 1e-6).any():
+        #             # Set minimum value to 1e-6
+        #             module.running_var = torch.clamp(module.running_var, min=1e-6)
+        #             fixed_count += 1
+        #             print(f"  Fixed running_var in {name}")
+        # if fixed_count > 0:
+        #     print(f"  Total fixed: {fixed_count} BatchNorm2d layers")
+        # else:
+        #     print(f"  No running_var values needed fixing")
+    
+        # Recalibrate BN statistics using current dataset
+        # def recalibrate_bn(model, dataloader, device, num_batches=50):
+        #     """
+        #     仅用于修复冻结层中损坏的 BN 统计量。
+        #     """
+        #     print("\n=== 开始重新校准 BatchNorm 统计量 ===")
+        
+        #     # 1. 强制让 Backbone 处于 Train 模式
+        #     # 这会开启 BN 层的统计量更新 (track_running_stats=True)
+        #     model.ferret_backbone.train()
+        
+        #     # 2. 确保不需要梯度（因为我们只更新统计量，不更新权重）
+        #     model.ferret_backbone.requires_grad_(False)
+        
+        #     with torch.no_grad():
+        #         for i, batch in enumerate(dataloader):
+        #             if i >= num_batches: break # 跑几十个 Batch 就足够收敛了
+                
+        #             # 3. 准备数据
+        #             images = batch['orig'].to(device, non_blocking=True)
+                
+        #             # 4. 前向传播
+        #             # 这一步会自动更新 model.ferret_backbone 里所有 BN 层的 running_mean/var
+        #             _ = model.ferret_backbone(images)
+                
+        #             if i % 10 == 0:
+        #                 print(f"  校准进度: {i}/{num_batches}")
+    
+        #     # 5. 校准完成，切回 Eval 模式（冻结行为）
+        #     model.ferret_backbone.eval()
+        #     print("=== 校准完成！BN 统计量已修复为当前数据的真实分布 ===")
+    
+        # # 使用当前的 train_loader 校准 BN 统计量
+        # recalibrate_bn(model, train_loader, device, num_batches=50)
+    
+        # # Freeze all parameters first
+        # for p in model.ferret_backbone.parameters():
+        #     p.requires_grad = False
+    
+        # # Make MLDC parameters trainable since they're not from preloaded weights
+        # for p in model.ferret_backbone.mldc.parameters():
+        #     p.requires_grad = True
+
+        # Setup trainable parameters
+        trainable_params = collect_trainable_params(
+            model,
+            freeze_adapters=freeze_adapters,
+            freeze_ferret=freeze_ferret,
+            freeze_ferret_unet_only=freeze_ferret_unet_only,
         )
+
+        # Initialize optimizer
+        optimizer = torch.optim.AdamW(
+            build_optimizer_param_groups(
+                model,
+                trainable_params,
+                base_lr=lr,
+                prompt_calibrator_lr_multiplier=coarse_prompt_calibrator_lr_multiplier,
+                coarse_prompt_head_lr_multiplier=coarse_prompt_head_lr_multiplier,
+            ),
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+
+        # Create learning rate scheduler
+        if scheduler_type == "onecycle":
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=args.lr,
+                steps_per_epoch=len(train_loader),
+                epochs=args.epochs,
+                div_factor=25,  # Increased div_factor for more gradual warmup
+                final_div_factor=100,  # Increased final_div_factor for smoother decay
+                pct_start=0.3,  # Increased warmup to 30% of epochs
+                anneal_strategy="cos",
+            )
+        elif scheduler_type == "cosine":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=args.epochs,
+                eta_min=lr * 0.001  # Lower minimum learning rate
+            )
+        elif scheduler_type == "none":
+            scheduler = None
+        else:
+            raise ValueError(f"Unknown scheduler type: {scheduler_type}")
+
+        # Initialize EMA
+        ema = EMA(model, decay=ema_decay)
+        if checkpoint_data and "ema" in checkpoint_data:
+            ema.load_state_dict(checkpoint_data["ema"])
+            logger.info("Loaded EMA weights from checkpoint.")
+
+        # Initialize training state
+        best_score = 0.0 if reset_best_score else (checkpoint_data.get("score", 0.0) if checkpoint_data else 0.0)
+        if reset_best_score and checkpoint_data:
+            logger.info("Reset best_score to 0.0 for resumed run checkpoint selection.")
+        start_epoch = checkpoint_data.get("epoch", 0) + 1 if checkpoint_data else 1
+
+        # Initialize metrics history for tracking
+        metrics_history = {
+            'train_losses': [], 'val_ious': [], 'val_f1s': [],
+            'small_iou': [], 'medium_iou': [], 'large_iou': [],
+            'small_f1': [], 'medium_f1': [], 'large_f1': [],
+            'small_count': [], 'medium_count': [], 'large_count': [],
+            'dataset_metrics': {},
+            'dataset_size_metrics': {},  # NEW: Add dataset-specific size metrics
+            'train_iou': [], 'val_iou_epoch': [], 'iou_divergence': []
+        }
+
+        # Training loop
+        for epoch in range(start_epoch, args.epochs + 1):
+            loss_list, val_metrics_list, best_score, train_ious = train_epoch(
+                model=model,
+                loader=train_loader,
+                optimizer=optimizer,
+                device=device,
+                scheduler=scheduler,
+                val_loader=val_loader,
+                validate_fn=validate,
+                epoch=epoch,
+                total_epochs=args.epochs,
+                val_steps=val_steps,
+                lambda_focal=lambda_focal,
+                focal_gamma=focal_gamma,
+                focal_alpha=focal_alpha,
+                model_save_path=model_save_path,
+                best_score=best_score,
+                ema=ema,
+                lambda_iou=lambda_iou,
+                train_sam_iou=train_sam_iou,
+                model_params=model_params,
+                authentic_ratio=authentic_ratio,  # Pass authentic_ratio
+                lambda_detection=lambda_detection,  # Pass detection loss weight
+                coarse_loss_weight=coarse_loss_weight,
+                coarse_dice_weight=coarse_dice_weight,
+                adapter_delta_reg_weight=adapter_delta_reg_weight,
+                coarse_prompt_calibrator_reg_weight=coarse_prompt_calibrator_reg_weight,
+                prompt_bias_supervision_weight=prompt_bias_supervision_weight,
+                prompt_bias_supervision_loss=prompt_bias_supervision_loss,
+                prompt_bias_supervision_max_delta_bias=prompt_bias_supervision_max_delta_bias,
+                final_logit_calibrator_supervision_weight=final_logit_calibrator_supervision_weight,
+                final_logit_calibrator_supervision_loss=final_logit_calibrator_supervision_loss,
+                final_logit_calibrator_supervision_max_delta_bias=final_logit_calibrator_supervision_max_delta_bias,
+                final_logit_calibrator_oracle_thresholds=final_logit_oracle_thresholds,
+                final_logit_calibrator_oracle_min_threshold=final_logit_calibrator_oracle_min_threshold,
+                final_logit_calibrator_oracle_max_threshold=final_logit_calibrator_oracle_max_threshold,
+                final_logit_calibrator_oracle_false_positive_penalty=final_logit_calibrator_oracle_false_positive_penalty,
+                final_logit_calibrator_oracle_area_penalty=final_logit_calibrator_oracle_area_penalty,
+                final_logit_spatial_supervision_weight=final_logit_spatial_supervision_weight,
+                final_logit_spatial_supervision_loss=final_logit_spatial_supervision_loss,
+                final_logit_spatial_supervision_target_scale=final_logit_spatial_supervision_target_scale,
+                final_logit_spatial_supervision_target_mode=final_logit_spatial_supervision_target_mode,
+                final_logit_spatial_supervision_hard_threshold=final_logit_spatial_supervision_hard_threshold,
+                dense_prompt_residual_reg_weight=dense_prompt_residual_reg_weight,
+                dense_prompt_signed_residual_supervision_weight=dense_prompt_signed_residual_supervision_weight,
+                dense_prompt_signed_residual_target_source=dense_prompt_signed_residual_target_source,
+                dense_prompt_signed_residual_loss=dense_prompt_signed_residual_loss,
+                dense_prompt_signed_residual_target_scale=dense_prompt_signed_residual_target_scale,
+                dense_prompt_signed_residual_target_mode=dense_prompt_signed_residual_target_mode,
+                dense_prompt_signed_residual_hard_threshold=dense_prompt_signed_residual_hard_threshold,
+                dense_prompt_signed_residual_use_gate=dense_prompt_signed_residual_use_gate,
+                dense_prompt_signed_residual_max_gt_area=dense_prompt_signed_residual_max_gt_area,
+                dense_prompt_unet_identity_weight=dense_prompt_unet_identity_weight,
+                dense_prompt_unet_identity_loss=dense_prompt_unet_identity_loss,
+                dense_prompt_unet_residual_supervision_weight=dense_prompt_unet_residual_supervision_weight,
+                dense_prompt_unet_residual_loss=dense_prompt_unet_residual_loss,
+                dense_prompt_unet_residual_target_scale=dense_prompt_unet_residual_target_scale,
+                dense_prompt_unet_residual_target_mode=dense_prompt_unet_residual_target_mode,
+                dense_prompt_unet_residual_hard_threshold=dense_prompt_unet_residual_hard_threshold,
+                dense_prompt_unet_residual_use_gate=dense_prompt_unet_residual_use_gate,
+                dense_prompt_unet_residual_max_gt_area=dense_prompt_unet_residual_max_gt_area,
+                coarse_prompt_loss_weight=coarse_prompt_loss_weight,
+                coarse_prompt_dice_weight=coarse_prompt_dice_weight,
+                coarse_prompt_false_negative_weight=coarse_prompt_false_negative_weight,
+                coarse_prompt_false_positive_weight=coarse_prompt_false_positive_weight,
+                coarse_prompt_supervision_source=coarse_prompt_supervision_source,
+                coarse_prompt_supervision_max_gt_area=coarse_prompt_supervision_max_gt_area,
+                prompt_gate_supervision_weight=prompt_gate_supervision_weight,
+                prompt_gate_target_source=prompt_gate_target_source,
+                prompt_gate_target_mode=prompt_gate_target_mode,
+                prompt_gate_sources=prompt_gate_sources,
+                prompt_gate_loss=prompt_gate_loss,
+                dual_branch_prompt_gate_supervision_weight=dual_branch_prompt_gate_supervision_weight,
+                dual_branch_prompt_gate_target_source=dual_branch_prompt_gate_target_source,
+                dual_branch_prompt_gate_target_mode=dual_branch_prompt_gate_target_mode,
+                dual_branch_prompt_gate_hard_threshold=dual_branch_prompt_gate_hard_threshold,
+                dual_branch_prompt_gate_loss=dual_branch_prompt_gate_loss,
+                dual_branch_prompt_residual_supervision_weight=dual_branch_prompt_residual_supervision_weight,
+                dual_branch_prompt_residual_target_source=dual_branch_prompt_residual_target_source,
+                dual_branch_prompt_residual_loss=dual_branch_prompt_residual_loss,
+                dual_branch_prompt_residual_target_scale=dual_branch_prompt_residual_target_scale,
+                dual_branch_prompt_residual_target_mode=dual_branch_prompt_residual_target_mode,
+                dual_branch_prompt_residual_hard_threshold=dual_branch_prompt_residual_hard_threshold,
+                dual_prompt_fusion_supervision_weight=dual_prompt_fusion_supervision_weight,
+                dual_prompt_fusion_oracle_metric=dual_prompt_fusion_oracle_metric,
+                dual_prompt_fusion_loss=dual_prompt_fusion_loss,
+                prompt_gate_refiner_max=coarse_prompt_refiner_gate_max,
+                prompt_gate_dense_max=coarse_prompt_gate_max,
+                area_reg_weight=area_reg_weight,
+                area_reg_target_source=area_reg_target_source,
+                area_reg_loss=area_reg_loss,
+                area_reg_apply_to=area_reg_apply_to,
+                area_reg_constant=area_reg_constant,
+                area_reg_max_gt_area=area_reg_max_gt_area,
+                reload_diagnostics_batches=reload_diagnostics_batches,
+                checkpoint_save_mode=checkpoint_save_mode,
+                writer=writer,
+            )
+        
+            # Update metrics history
+            metrics_history['train_losses'].extend(loss_list)
+        
+            # Process validation metrics
+            if val_metrics_list:
+                epoch_metrics = aggregate_epoch_metrics(val_metrics_list)
+            
+                # Store overall metrics
+                metrics_history['val_ious'].extend([vm["iou"] for vm in val_metrics_list])
+                metrics_history['val_f1s'].extend([vm["f1"] for vm in val_metrics_list])
+            
+                # Store stratified metrics
+                for size in ['small', 'medium', 'large']:
+                    for metric in ['iou', 'f1', 'count']:
+                        key = f'{size}_{metric}'
+                        metrics_history[key].append(epoch_metrics.get(key, 0.0))
+            
+                # Store dataset-specific metrics
+                if 'dataset_metrics' in epoch_metrics:
+                    for dataset_name, dataset_result in epoch_metrics['dataset_metrics'].items():
+                        if dataset_name not in metrics_history['dataset_metrics']:
+                            metrics_history['dataset_metrics'][dataset_name] = {
+                                'iou_history': [], 'f1_history': [], 'count_history': []
+                            }
+                    
+                        metrics_history['dataset_metrics'][dataset_name]['iou_history'].append(dataset_result['iou'])
+                        metrics_history['dataset_metrics'][dataset_name]['f1_history'].append(dataset_result['f1'])
+                        metrics_history['dataset_metrics'][dataset_name]['count_history'].append(dataset_result['count'])
+            
+                # NEW: Store dataset-specific SIZE metrics
+                if 'dataset_size_metrics' in epoch_metrics:
+                    for dataset_name, size_results in epoch_metrics['dataset_size_metrics'].items():
+                        if dataset_name not in metrics_history['dataset_size_metrics']:
+                            metrics_history['dataset_size_metrics'][dataset_name] = {
+                                f'{size}_{metric}_history': []
+                                for size in ['small', 'medium', 'large']
+                                for metric in ['iou', 'f1', 'count']
+                            }
+                    
+                        for size in ['small', 'medium', 'large']:
+                            for metric in ['iou', 'f1', 'count']:
+                                key = f'{size}_{metric}'
+                                history_key = f'{size}_{metric}_history'
+                                value = size_results.get(key, 0.0)
+                                metrics_history['dataset_size_metrics'][dataset_name][history_key].append(value)
+            
+                # Handle IoU tracking
+                if train_ious:
+                    epoch_train_iou = np.mean(train_ious)
+                    epoch_val_iou = epoch_metrics.get('overall_iou', 0.0)
+                
+                    metrics_history['train_iou'].append(epoch_train_iou)
+                    metrics_history['val_iou_epoch'].append(epoch_val_iou)
+                    metrics_history['iou_divergence'].append(epoch_train_iou - epoch_val_iou)
+                
+                    logger.info(
+                        "Epoch %s IoU | train=%.4f val=%.4f divergence=%.4f",
+                        epoch,
+                        epoch_train_iou,
+                        epoch_val_iou,
+                        epoch_train_iou - epoch_val_iou,
+                    )
+        
+            # Generate metrics visualization
+            logger.info(
+                "Epoch %s completed. Saving metrics visualization at %s",
+                epoch,
+                os.path.join(experiment_dir, 'metrics.png'),
+            )
+            plot_all_metrics(
+                metrics_history,
+                True,
+                save_path=os.path.join(experiment_dir, "metrics.png")
+            )
 
 
 def aggregate_epoch_metrics(val_metrics_list: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -3907,7 +3952,7 @@ FOCAL_GAMMA = 1.0
 FOCAL_ALPHA = 0.55
 WEIGHT_DECAY = 0.0001
 PROMPT_DIM = 64
-SAVE_PATH = "results/sam2_forgery.pth"
+SAVE_PATH = os.path.join(RESULTS_DIR, "sam2_forgery.pth")
 DOWNSCALE = 16
 LAMBDA_IOU = 0.25
 DROPOUT_RATE = 0.2
