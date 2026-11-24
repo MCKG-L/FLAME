@@ -3,9 +3,9 @@
 import argparse
 import subprocess
 import sys
+from math import isfinite
 from pathlib import Path
 from tempfile import TemporaryDirectory
-
 
 # Select dataset paths and loader defaults for "windows", "server", or "wsl".
 PATH_PROFILE = "wsl"
@@ -36,6 +36,12 @@ else:
         "sid": {"train": DATA_ROOT / "sid_train", "val": DATA_ROOT / "sid_validation", "test": DATA_ROOT / "sid_test"},
     }
 
+TEST_DATASET_PATHS = {family: splits["test"] for family, splits in DATASET_PATHS.items()}
+TEST_DATASET_PATHS.update({
+    "autosplice": DATA_ROOT / "AutoSplice" / "AutoSplice",
+    "cocoglide": DATA_ROOT / "CocoGlide",
+})
+
 OUTPUT_DIR = APP_DIR / "outputs"
 CHECKPOINT = APP_DIR / "checkpoints" / "flame_g2_ladmulti_sam2.pth"
 MODEL_CONFIG = APP_DIR / "checkpoints" / "model_params.json"
@@ -47,17 +53,9 @@ def run_script(script: str, arguments: list[str]) -> int:
     return subprocess.run(command, cwd=APP_DIR.parent).returncode
 
 
-def train(args: argparse.Namespace) -> int:
-    from utils.dataset_config import DataLoaderConfig, DatasetConfig, DatasetManagerConfig, save_dataset_config
+def run_training(config, arguments: list[str]) -> int:
+    from utils.dataset_config import save_dataset_config
 
-    config = DatasetManagerConfig(
-        train_datasets=[DatasetConfig("train", str(args.train_dataset.resolve()), force_resize=True)],
-        val_datasets=[DatasetConfig("val", str(args.val_dataset.resolve()), is_training=False)],
-        train_loader=DataLoaderConfig(batch_size=args.batch_size, num_workers=0, drop_last=False),
-        val_loader=DataLoaderConfig(batch_size=1, num_workers=0, shuffle=False, drop_last=False),
-    )
-    image_count = sum(path.is_file() for path in (args.train_dataset / "target").iterdir())
-    batches_per_epoch = (image_count + args.batch_size - 1) // args.batch_size
     with TemporaryDirectory(prefix="flame-train-") as temporary_dir:
         config_path = Path(temporary_dir) / "datasets.json"
         save_dataset_config(config, str(config_path))
@@ -68,12 +66,61 @@ def train(args: argparse.Namespace) -> int:
             "--sam_ckpt", str(SAM_CHECKPOINT),
             "--forensic_operator", "lad_multi",
             "--img_size", "512",
-            "--authentic_ratio", "0",
-            "--batch_size", str(args.batch_size),
-            "--epochs", str(args.epochs),
-            "--val_steps", str(batches_per_epoch),
-            "--reload_diagnostics_batches", str(args.reload_diagnostics_batches),
+            *arguments,
         ])
+
+
+def train(args: argparse.Namespace) -> int:
+    from utils.dataset_config import DataLoaderConfig, DatasetConfig, DatasetManagerConfig
+
+    config = DatasetManagerConfig(
+        train_datasets=[DatasetConfig("train", str(args.train_dataset.resolve()), force_resize=True)],
+        val_datasets=[DatasetConfig("val", str(args.val_dataset.resolve()), is_training=False)],
+        train_loader=DataLoaderConfig(batch_size=args.batch_size, num_workers=0, drop_last=False),
+        val_loader=DataLoaderConfig(batch_size=1, num_workers=0, shuffle=False, drop_last=False),
+    )
+    image_count = sum(path.is_file() for path in (args.train_dataset / "target").iterdir())
+    batches_per_epoch = (image_count + args.batch_size - 1) // args.batch_size
+    return run_training(config, [
+        "--authentic_ratio", "0",
+        "--batch_size", str(args.batch_size),
+        "--epochs", str(args.epochs),
+        "--val_steps", str(batches_per_epoch),
+        "--reload_diagnostics_batches", str(args.reload_diagnostics_batches),
+    ])
+
+
+def train_joint(authentic_ratio: float, lambda_detection: float) -> int:
+    from utils.dataset_config import DataLoaderConfig, DatasetConfig, DatasetManagerConfig
+
+    magicbrush = DATASET_PATHS["magicbrush"]
+    sid = DATASET_PATHS["sid"]
+    batch_size, train_workers, val_workers = (4, 4, 2) if PATH_PROFILE == "server" else (1, 0, 0)
+    config = DatasetManagerConfig(
+        train_datasets=[
+            DatasetConfig("magicbrush_multiedit_train", str(magicbrush["train"].resolve()), force_resize=True),
+            DatasetConfig("sid_train", str(sid["train"].resolve()), force_resize=True),
+        ],
+        val_datasets=[
+            DatasetConfig(
+                "magicbrush_multiedit_val", str(magicbrush["val"].resolve()), is_training=False, force_resize=True,
+            ),
+            DatasetConfig("sid_validation", str(sid["val"].resolve()), is_training=False, force_resize=True),
+        ],
+        train_loader=DataLoaderConfig(
+            batch_size=batch_size, num_workers=train_workers, drop_last=False,
+            persistent_workers=train_workers > 0,
+        ),
+        val_loader=DataLoaderConfig(
+            batch_size=batch_size, num_workers=val_workers, shuffle=False, drop_last=False,
+        ),
+    )
+    return run_training(config, [
+        "--authentic_ratio", str(authentic_ratio),
+        "--lambda_detection", str(lambda_detection),
+        "--batch_size", str(batch_size),
+        "--epochs", "3",
+    ])
 
 
 def infer(args: argparse.Namespace) -> int:
@@ -133,7 +180,11 @@ def main() -> int:
     training.add_argument("--reload-diagnostics-batches", type=int, default=0,
                           help="Compare this many validation batches after saving a best checkpoint")
 
-    modes.add_parser("train-joint", help="Train LAD-Multi jointly on MagicBrush and SID")
+    joint_training = modes.add_parser("train-joint", help="Train LAD-Multi jointly on MagicBrush and SID")
+    joint_training.add_argument("--authentic_ratio", "--authentic-ratio", type=float,
+                                help="Target fraction of authentic images to sample from each dataset's source/")
+    joint_training.add_argument("--lambda_detection", "--lambda-detection", type=float,
+                                help="Weight of the image-level detection loss (default with overrides: 1.0)")
 
     inference = modes.add_parser("infer", help="Save a binary mask for one image")
     inference.add_argument("--image", type=Path, required=True)
@@ -143,7 +194,7 @@ def main() -> int:
     testing = modes.add_parser("test", help="Evaluate a dataset with ground-truth masks")
     testing.add_argument("--experiment-dir", type=Path,
                          help="Use best_model.pth and model_params.json from this training experiment")
-    testing.add_argument("--dataset-family", choices=DATASET_PATHS, default="magicbrush",
+    testing.add_argument("--dataset-family", choices=TEST_DATASET_PATHS, default="magicbrush",
                          help="Use the configured test directory (default: magicbrush)")
     testing.add_argument("--dataset", type=Path)
     testing.add_argument("--output", type=Path)
@@ -163,7 +214,29 @@ def main() -> int:
 
     args = parser.parse_args()
     if args.mode == "train-joint":
-        return run_script("train_joint.py", [])
+        if args.authentic_ratio is None and args.lambda_detection is None:
+            return run_script("train_joint.py", [])
+        authentic_ratio = args.authentic_ratio if args.authentic_ratio is not None else 0.0
+        lambda_detection = args.lambda_detection if args.lambda_detection is not None else 1.0
+        if not 0.0 <= authentic_ratio <= 1.0:
+            joint_training.error("--authentic-ratio must be between 0 and 1")
+        if not isfinite(lambda_detection) or lambda_detection < 0.0:
+            joint_training.error("--lambda-detection must be finite and nonnegative")
+
+        for splits in DATASET_PATHS.values():
+            for split in ("train", "val"):
+                root = splits[split]
+                if not (root / "target").is_dir() or not (root / "mask").is_dir():
+                    joint_training.error(f"Expected target/ and mask/ directories inside {root}")
+        if authentic_ratio > 0.0:
+            source_dirs = [splits["train"] / "source" for splits in DATASET_PATHS.values()]
+            if not any(
+                image.is_file() and image.suffix.lower() in {".png", ".jpg", ".jpeg"}
+                for source in source_dirs if source.is_dir()
+                for image in source.iterdir()
+            ):
+                joint_training.error("Authentic training requires images in a training dataset's source/ directory")
+        return train_joint(authentic_ratio, lambda_detection)
 
     if args.mode == "test" and args.experiment_dir is not None:
         experiment_dir = args.experiment_dir.resolve()
@@ -196,7 +269,7 @@ def main() -> int:
         args.val_dataset = args.val_dataset or splits["val"]
         datasets = (args.train_dataset, args.val_dataset)
     else:
-        args.dataset = args.dataset or DATASET_PATHS[args.dataset_family]["test"]
+        args.dataset = args.dataset or TEST_DATASET_PATHS[args.dataset_family]
         args.output = args.output or OUTPUT_DIR / f"{args.dataset_family}_test"
         datasets = (args.dataset,)
 
@@ -228,19 +301,27 @@ conda activate flame
 # 联合使用 MagicBrush 和 SID 训练，并分别使用各自的验证集
 python FLAME/run_flame.py train-joint
 
-# 可选的 MagicBrush 单数据集训练，使用配置中的验证集
+# 加入真图训练
+python FLAME/run_flame.py train-joint --authentic_ratio 0.2 --lambda_detection 1.0
+
+
+# MagicBrush 单数据集训练，使用配置中的验证集
 python FLAME/run_flame.py train --dataset-family magicbrush --epochs 3 --batch-size 1
 
 # MagicBrush 测试
 python FLAME/run_flame.py test
 
-# 可选的 SID 单数据集训练，使用 sid_validation 做验证
+# SID 单数据集训练，使用 sid_validation 做验证
 python FLAME/run_flame.py train --dataset-family sid --epochs 3 --batch-size 1
 
-# SID 测试，sid_test 内需有配对的 target/ 和 mask/
+# SID 测试
 python FLAME/run_flame.py test --dataset-family sid
 # 在服务器上按原示例的批大小评估 SID
 # python FLAME/run_flame.py test --dataset-family sid --batch-size 64
+
+# AutoSplice 和 CoCoGLIDE 测试，默认计算像素级定位指标
+python FLAME/run_flame.py test --dataset-family autosplice
+python FLAME/run_flame.py test --dataset-family cocoglide
 
 # 测试 results 中某次训练的 best_model.pth，自动读取同目录的 model_params.json。
 # 将 --experiment-dir 改为要评估的实验目录，结果保存在该目录的 evaluation/ 下。
