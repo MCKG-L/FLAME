@@ -468,6 +468,8 @@ def main():
                         help='After loading the model state, overlay EMA weights from the checkpoint if present')
     
     args = parser.parse_args()
+    if not 0.0 <= args.authentic_ratio <= 1.0:
+        parser.error('--authentic_ratio must be between 0 and 1')
     
     # Setup device
     device = torch.device(args.device)
@@ -540,7 +542,11 @@ def main():
     )
     
     # Save results to JSON file
-    results_file = os.path.join(args.output, 'evaluation_results.json')
+    results_filename = 'evaluation_results.json'
+    if args.authentic_ratio > 0.0:
+        ratio = str(args.authentic_ratio).removesuffix('.0')
+        results_filename = f'evaluation_results_authentic_ratio_{ratio}.json'
+    results_file = os.path.join(args.output, results_filename)
     with open(results_file, 'w') as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
     

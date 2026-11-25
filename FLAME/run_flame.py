@@ -9,7 +9,7 @@ from tempfile import TemporaryDirectory
 from utils.early_stopping import add_early_stopping_arguments, early_stopping_cli_arguments
 
 # Select dataset paths and loader defaults for "windows", "server", or "wsl".
-PATH_PROFILE = "server"
+PATH_PROFILE = "wsl"
 
 JOINT_BATCH_SIZE = 48 if PATH_PROFILE == "server" else 1
 TEST_BATCH_SIZE, TEST_NUM_WORKERS = (64, 2) if PATH_PROFILE == "server" else (1, 0)
@@ -279,28 +279,34 @@ python FLAME/run_flame.py train --dataset-family magicbrush --epochs 3 --batch-s
 # SID 单数据集训练，使用 sid_validation 做验证
 python FLAME/run_flame.py train --dataset-family sid --epochs 3 --batch-size 1
 
-# 单数据集训练也支持早停
+# 单数据集训练+早停
 python FLAME/run_flame.py train --dataset-family magicbrush --epochs 3 --batch-size 1 --early-stopping
-
+=====================================================================
 ====================使用官网权重测试===================================
-# MagicBrush 测试
-python FLAME/run_flame.py test
 
-# SID 测试
-python FLAME/run_flame.py test --dataset-family sid
-# 在服务器上按原示例的批大小评估 SID
-# python FLAME/run_flame.py test --dataset-family sid --batch-size 64
-
-# AutoSplice 和 CoCoGLIDE 测试，默认计算像素级定位指标
+# 测试参数--dataset-family: ===> magicbrush sid autosplice cocoglide
 python FLAME/run_flame.py test --dataset-family autosplice
-python FLAME/run_flame.py test --dataset-family cocoglide
 
+==================--authentic-ratio 1.0加入真图测试====================
+# 为了评估整图层面的检测ACC和AP需要加入真图作测试
+# 结果保存到 FLAME/outputs/magicbrush_test/evaluation_results_authentic-ratio_1.json
+python FLAME/run_flame.py test --dataset-family magicbrush --authentic-ratio 1.0
+
+# 不同比例分别保存，例如 evaluation_results_authentic_ratio_0.2.json
+python FLAME/run_flame.py test --dataset-family magicbrush --authentic-ratio 0.2
+
+
+=======================================================================
 =====================使用训练得到的权重测试==============================
 # 测试 results 中某次训练的 best_model.pth，自动读取同目录的 model_params.json。
 # 将 --experiment-dir 改为要评估的实验目录，结果保存在该目录的 evaluation/ 下。
 
-# 使用同一训练权重测试 SID 参数选择[magicbrush、sid、autosplice、cocoglide]
+# 使用同一训练权重测试 SID 参数选择 magicbrush sid autosplice cocoglide
 python FLAME/run_flame.py test --dataset-family magicbrush \
+  --experiment-dir "FLAME/results/20261123_215019_DET_focal-gamma1p0_focal-alpha0p55_prompt-dim64_lr0p001_dropout-rate0p2_lad-tau0p004_forensic-o_8da0f231"
+
+# 加入真图后，JSON 保存在该实验的 evaluation/magicbrush_test/ 下，文件名包含 authentic_ratio
+python FLAME/run_flame.py test --dataset-family magicbrush --authentic-ratio 1.0 \
   --experiment-dir "FLAME/results/20261123_215019_DET_focal-gamma1p0_focal-alpha0p55_prompt-dim64_lr0p001_dropout-rate0p2_lad-tau0p004_forensic-o_8da0f231"
 
 # 对单张图片推理，默认输出到 FLAME/outputs/inference/
