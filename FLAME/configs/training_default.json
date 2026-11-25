@@ -1,0 +1,7 @@
+{
+  "early_stopping": {
+    "patience": 5,
+    "min_delta": 0.002,
+    "min_epochs": 1
+  }
+}

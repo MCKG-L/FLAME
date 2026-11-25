@@ -50,6 +50,7 @@ def build_checkpoint_payload(
     score: float,
     ema_state: Optional[Mapping[str, Any]] = None,
     checkpoint_save_mode: str = "full",
+    early_stopping_state: Optional[Mapping[str, Any]] = None,
 ) -> MutableMapping[str, Any]:
     """Build an immutable-in-memory checkpoint payload for a validation point."""
     mode = str(checkpoint_save_mode).lower()
@@ -66,6 +67,8 @@ def build_checkpoint_payload(
     }
     if ema_state is not None and mode == "full":
         payload["ema"] = clone_state_dict(ema_state)
+    if early_stopping_state is not None:
+        payload["early_stopping"] = dict(early_stopping_state)
     return payload
 
 

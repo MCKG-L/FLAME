@@ -5,10 +5,21 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from run_flame import DATASET_PATHS, PATH_PROFILE, SAM_CHECKPOINT, run_script
+from utils.early_stopping import add_early_stopping_arguments, early_stopping_cli_arguments
 
 
 def main() -> int:
-    argparse.ArgumentParser(description=__doc__).parse_args()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--epochs", "--epoch", type=int, default=3,
+                        help="Maximum number of training epochs (default: 3)")
+    add_early_stopping_arguments(parser)
+    args = parser.parse_args()
+    if args.epochs < 1:
+        parser.error("--epochs must be at least 1")
+    try:
+        early_stopping_args = early_stopping_cli_arguments(args)
+    except ValueError as error:
+        parser.error(str(error))
 
     train_batch_size, train_num_workers = (4, 4) if PATH_PROFILE == "server" else (1, 0)
     val_batch_size, val_num_workers = (64, 2) if PATH_PROFILE == "server" else (1, 0)
@@ -67,9 +78,10 @@ def main() -> int:
             "--forensic_operator", "lad_multi",
             "--img_size", "512",
             "--authentic_ratio", "0",
-            "--epochs", "3",
+            "--epochs", str(args.epochs),
             "--batch_size", str(train_batch_size),
             "--val_steps", "2000",
+            *early_stopping_args,
         ])
 
 

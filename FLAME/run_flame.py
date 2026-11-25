@@ -7,6 +7,8 @@ from math import isfinite
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from utils.early_stopping import add_early_stopping_arguments, early_stopping_cli_arguments
+
 # Select dataset paths and loader defaults for "windows", "server", or "wsl".
 PATH_PROFILE = "wsl"
 
@@ -70,7 +72,7 @@ def run_training(config, arguments: list[str]) -> int:
         ])
 
 
-def train(args: argparse.Namespace) -> int:
+def train(args: argparse.Namespace, early_stopping_args: list[str] | None = None) -> int:
     from utils.dataset_config import DataLoaderConfig, DatasetConfig, DatasetManagerConfig
 
     config = DatasetManagerConfig(
@@ -87,10 +89,12 @@ def train(args: argparse.Namespace) -> int:
         "--epochs", str(args.epochs),
         "--val_steps", str(batches_per_epoch),
         "--reload_diagnostics_batches", str(args.reload_diagnostics_batches),
+        *(early_stopping_args or []),
     ])
 
 
-def train_joint(authentic_ratio: float, lambda_detection: float) -> int:
+def train_joint(authentic_ratio: float, lambda_detection: float,
+                early_stopping_args: list[str] | None = None, epochs: int = 3) -> int:
     from utils.dataset_config import DataLoaderConfig, DatasetConfig, DatasetManagerConfig
 
     magicbrush = DATASET_PATHS["magicbrush"]
@@ -119,7 +123,8 @@ def train_joint(authentic_ratio: float, lambda_detection: float) -> int:
         "--authentic_ratio", str(authentic_ratio),
         "--lambda_detection", str(lambda_detection),
         "--batch_size", str(batch_size),
-        "--epochs", "3",
+        "--epochs", str(epochs),
+        *(early_stopping_args or []),
     ])
 
 
@@ -181,10 +186,14 @@ def main() -> int:
                           help="Compare this many validation batches after saving a best checkpoint")
 
     joint_training = modes.add_parser("train-joint", help="Train LAD-Multi jointly on MagicBrush and SID")
+    joint_training.add_argument("--epochs", "--epoch", type=int, default=3,
+                                help="Maximum number of training epochs (default: 3)")
     joint_training.add_argument("--authentic_ratio", "--authentic-ratio", type=float,
                                 help="Target fraction of authentic images to sample from each dataset's source/")
     joint_training.add_argument("--lambda_detection", "--lambda-detection", type=float,
                                 help="Weight of the image-level detection loss (default with overrides: 1.0)")
+    for training_mode in (training, joint_training):
+        add_early_stopping_arguments(training_mode)
 
     inference = modes.add_parser("infer", help="Save a binary mask for one image")
     inference.add_argument("--image", type=Path, required=True)
@@ -213,9 +222,17 @@ def main() -> int:
         mode.add_argument("--config", type=Path)
 
     args = parser.parse_args()
+    early_stopping_args = []
+    if args.mode in ("train", "train-joint"):
+        try:
+            early_stopping_args = early_stopping_cli_arguments(args)
+        except ValueError as error:
+            parser.error(str(error))
     if args.mode == "train-joint":
+        if args.epochs < 1:
+            joint_training.error("--epochs must be at least 1")
         if args.authentic_ratio is None and args.lambda_detection is None:
-            return run_script("train_joint.py", [])
+            return run_script("train_joint.py", ["--epochs", str(args.epochs), *early_stopping_args])
         authentic_ratio = args.authentic_ratio if args.authentic_ratio is not None else 0.0
         lambda_detection = args.lambda_detection if args.lambda_detection is not None else 1.0
         if not 0.0 <= authentic_ratio <= 1.0:
@@ -236,7 +253,7 @@ def main() -> int:
                 for image in source.iterdir()
             ):
                 joint_training.error("Authentic training requires images in a training dataset's source/ directory")
-        return train_joint(authentic_ratio, lambda_detection)
+        return train_joint(authentic_ratio, lambda_detection, early_stopping_args, epochs=args.epochs)
 
     if args.mode == "test" and args.experiment_dir is not None:
         experiment_dir = args.experiment_dir.resolve()
@@ -281,7 +298,7 @@ def main() -> int:
             training.error("--reload-diagnostics-batches must be nonnegative")
         if args.epochs < 1 or not any(path.is_file() for path in (args.train_dataset / "target").iterdir()):
             training.error("--epochs must be positive and the training dataset must contain images")
-        return train(args)
+        return train(args, early_stopping_args)
     if args.num_workers < 0:
         testing.error("--num-workers must be nonnegative")
     if args.num_vis_batches < 0:
@@ -304,9 +321,20 @@ python FLAME/run_flame.py train-joint
 # 加入真图训练
 python FLAME/run_flame.py train-joint --authentic_ratio 0.2 --lambda_detection 1.0
 
+# 启用早停，具体参数在 FLAME/configs/training_default.json 中设置。
+python FLAME/run_flame.py train-joint --early-stopping
+
+# 最多训练 10 轮，达到早停条件时提前结束
+python FLAME/run_flame.py train-joint --early-stopping --epochs 10
+
+# 加入真图并启用早停
+python FLAME/run_flame.py train-joint --authentic_ratio 0.2 --lambda_detection 1.0 --early-stopping
 
 # MagicBrush 单数据集训练，使用配置中的验证集
 python FLAME/run_flame.py train --dataset-family magicbrush --epochs 3 --batch-size 1
+
+# 单数据集训练也支持早停
+python FLAME/run_flame.py train --dataset-family magicbrush --epochs 3 --batch-size 1 --early-stopping
 
 # MagicBrush 测试
 python FLAME/run_flame.py test

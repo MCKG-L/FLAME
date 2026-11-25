@@ -28,6 +28,7 @@ from utils.train_utils import custom_collate_fn, get_param_strings
 from utils.dataset_config import DEFAULT_DATA_ROOT, DatasetManager, load_dataset_config, create_default_config
 from utils.sam_utils import initialize_sam_hydra
 from utils.validation_manifest import load_validation_manifest
+from utils.early_stopping import EarlyStopping, add_early_stopping_arguments, early_stopping_from_args
 
 
 logger = logging.getLogger(__name__)
@@ -478,10 +479,13 @@ def train_epoch(
     reload_diagnostics_batches: int = 0,
     checkpoint_save_mode: str = "full",
     writer: Optional[SummaryWriter] = None,
+    early_stopping: Optional[EarlyStopping] = None,
 ) -> Tuple[List[float], List[Dict], float, Optional[List[float]]]:
     """
     Train the model for one epoch.
     """
+    if early_stopping is not None and (val_steps <= 0 or val_loader is None or validate_fn is None):
+        raise ValueError("Early stopping requires validation data, a validation function and a positive val_steps")
     model.train()
     loss_list = []
     train_ious = [] if train_sam_iou else None
@@ -1219,7 +1223,10 @@ def train_epoch(
                 val_steps != 0
                 and val_loader is not None
                 and validate_fn is not None
-                and (batch_idx + 1) % val_steps == 0
+                and (
+                    (batch_idx + 1) % val_steps == 0
+                    or (early_stopping is not None and batch_idx + 1 == len(loader))
+                )
             ):
                 logger.info(
                     "Performing validation at batch %s/%s",
@@ -1233,123 +1240,145 @@ def train_epoch(
                     if device.type == "cuda":
                         torch.clear_autocast_cache()
 
-                val_metrics = validate_fn(
-                    model, val_loader, device, 
-                    save_vis_path=os.path.join(
-                        os.path.dirname(model_save_path), "vis", 
-                        f"epoch{epoch:03d}_step{batch_idx:06d}"
-                    ), 
-                    contrastive_blur=contrastive_blur,
-                    use_tiling=False,
-                )
-                
-                logger.info(
-                    "Validation metrics | F1=%.4f IoU=%.4f",
-                    val_metrics['f1'],
-                    val_metrics['iou'],
-                )
-                val_metrics_list.append(val_metrics)
+                try:
+                    val_metrics = validate_fn(
+                        model, val_loader, device,
+                        save_vis_path=os.path.join(
+                            os.path.dirname(model_save_path), "vis",
+                            f"epoch{epoch:03d}_step{batch_idx:06d}"
+                        ),
+                        contrastive_blur=contrastive_blur,
+                        use_tiling=False,
+                    )
 
-                if writer is not None:
-                    for name, value in val_metrics.items():
-                        if isinstance(value, (int, float, np.number)):
-                            writer.add_scalar(f"Validation/{name}", value, global_step)
-                    for dataset_name, dataset_result in val_metrics.get("dataset_results", {}).items():
-                        for metric in ("iou", "f1"):
-                            writer.add_scalar(
-                                f"Validation/datasets/{dataset_name}/{metric}",
-                                dataset_result[metric],
-                                global_step,
-                            )
-                    writer.flush()
+                    logger.info(
+                        "Validation metrics | F1=%.4f IoU=%.4f",
+                        val_metrics['f1'],
+                        val_metrics['iou'],
+                    )
+                    val_metrics_list.append(val_metrics)
 
-                # Save model if it's the best so far
-                if val_metrics["f1"] + val_metrics["iou"] > best_score:
-                    best_score = val_metrics["f1"] + val_metrics["iou"]
-                    save_mode = str(checkpoint_save_mode).lower()
-                    if save_mode == "none":
+                    if early_stopping is not None:
+                        early_stopping.update(float(val_metrics["f1"] + val_metrics["iou"]), epoch or 1)
                         logger.info(
-                            "Checkpoint save skipped by checkpoint_save_mode=none | best_score=%.4f",
-                            best_score,
+                            "Early stopping | score=%.6f reference=%.6f waiting=%s/%s warmup=%s",
+                            val_metrics["f1"] + val_metrics["iou"], early_stopping.reference_score,
+                            early_stopping.bad_checks, early_stopping.patience,
+                            (epoch or 1) <= early_stopping.min_epochs,
                         )
-                    else:
-                        # Prepare checkpoint data.  Clone tensors while EMA
-                        # weights are still applied so restore() cannot mutate the
-                        # in-memory payload before torch.save finishes or before
-                        # optional reload diagnostics inspect it.
-                        checkpoint_data = build_checkpoint_payload(
-                            model=model,
-                            epoch=epoch,
-                            batch=batch_idx,
-                            score=best_score,
-                            ema_state=ema.state_dict() if ema is not None else None,
-                            checkpoint_save_mode=save_mode,
-                        )
+                        if writer is not None:
+                            writer.add_scalar("EarlyStopping/waiting", early_stopping.bad_checks, global_step)
 
-                        # Save best model
-                        torch.save(checkpoint_data, model_save_path)
-
-                        # Save checkpoint with timestamp
-                        checkpoint_path = os.path.join(
-                            os.path.dirname(model_save_path),
-                            "checkpoints",
-                            f"model_epoch{epoch}_batch{batch_idx}_score{best_score:.4f}.pth",
-                        )
-                        torch.save(checkpoint_data, checkpoint_path)
-                        
-                        # Save parameters alongside checkpoint
-                        if model_params is not None:
-                            checkpoint_params_path = checkpoint_path.replace('.pth', '_params.json')
-                            with open(checkpoint_params_path, 'w') as f:
-                                json.dump(model_params, f, indent=2)
-
-                        logger.info(
-                            "Model checkpoint updated | path=%s best_score=%.4f mode=%s",
-                            model_save_path,
-                            best_score,
-                            save_mode,
-                        )
-                        logger.debug("Checkpoint saved to %s", checkpoint_path)
-
-                        if (
-                            reload_diagnostics_batches > 0
-                            and val_loader is not None
-                            and model_params is not None
-                        ):
-                            diagnostic_path = os.path.join(
-                                os.path.dirname(model_save_path),
-                                "reload_diagnostics",
-                                f"epoch{epoch:03d}_batch{batch_idx:06d}.json",
-                            )
-                            try:
-                                run_live_reload_diagnostic(
-                                    live_model=model,
-                                    checkpoint_path=checkpoint_path,
-                                    model_params=model_params,
-                                    val_loader=val_loader,
-                                    device=device,
-                                    output_path=diagnostic_path,
-                                    num_batches=reload_diagnostics_batches,
+                    if writer is not None:
+                        for name, value in val_metrics.items():
+                            if isinstance(value, (int, float, np.number)):
+                                writer.add_scalar(f"Validation/{name}", value, global_step)
+                        for dataset_name, dataset_result in val_metrics.get("dataset_results", {}).items():
+                            for metric in ("iou", "f1"):
+                                writer.add_scalar(
+                                    f"Validation/datasets/{dataset_name}/{metric}",
+                                    dataset_result[metric],
+                                    global_step,
                                 )
-                            except Exception:
-                                logger.exception("Live-vs-reload diagnostic failed")
+                        writer.flush()
 
-                # Restore original weights after validation
-                if ema is not None:
-                    ema.restore()
-                    if device.type == "cuda":
-                        torch.clear_autocast_cache()
+                    # Save model if it's the best so far
+                    if val_metrics["f1"] + val_metrics["iou"] > best_score:
+                        best_score = val_metrics["f1"] + val_metrics["iou"]
+                        save_mode = str(checkpoint_save_mode).lower()
+                        if save_mode == "none":
+                            logger.info(
+                                "Checkpoint save skipped by checkpoint_save_mode=none | best_score=%.4f",
+                                best_score,
+                            )
+                        else:
+                            # Prepare checkpoint data.  Clone tensors while EMA
+                            # weights are still applied so restore() cannot mutate the
+                            # in-memory payload before torch.save finishes or before
+                            # optional reload diagnostics inspect it.
+                            checkpoint_data = build_checkpoint_payload(
+                                model=model,
+                                epoch=epoch,
+                                batch=batch_idx,
+                                score=best_score,
+                                ema_state=ema.state_dict() if ema is not None else None,
+                                checkpoint_save_mode=save_mode,
+                                early_stopping_state=early_stopping.state_dict() if early_stopping is not None else None,
+                            )
 
-                model.train()
+                            # Save best model
+                            torch.save(checkpoint_data, model_save_path)
+
+                            # Save checkpoint with timestamp
+                            checkpoint_path = os.path.join(
+                                os.path.dirname(model_save_path),
+                                "checkpoints",
+                                f"model_epoch{epoch}_batch{batch_idx}_score{best_score:.4f}.pth",
+                            )
+                            torch.save(checkpoint_data, checkpoint_path)
+
+                            # Save parameters alongside checkpoint
+                            if model_params is not None:
+                                checkpoint_params_path = checkpoint_path.replace('.pth', '_params.json')
+                                with open(checkpoint_params_path, 'w') as f:
+                                    json.dump(model_params, f, indent=2)
+
+                            logger.info(
+                                "Model checkpoint updated | path=%s best_score=%.4f mode=%s",
+                                model_save_path,
+                                best_score,
+                                save_mode,
+                            )
+                            logger.debug("Checkpoint saved to %s", checkpoint_path)
+
+                            if (
+                                reload_diagnostics_batches > 0
+                                and val_loader is not None
+                                and model_params is not None
+                            ):
+                                diagnostic_path = os.path.join(
+                                    os.path.dirname(model_save_path),
+                                    "reload_diagnostics",
+                                    f"epoch{epoch:03d}_batch{batch_idx:06d}.json",
+                                )
+                                try:
+                                    run_live_reload_diagnostic(
+                                        live_model=model,
+                                        checkpoint_path=checkpoint_path,
+                                        model_params=model_params,
+                                        val_loader=val_loader,
+                                        device=device,
+                                        output_path=diagnostic_path,
+                                        num_batches=reload_diagnostics_batches,
+                                    )
+                                except Exception:
+                                    logger.exception("Live-vs-reload diagnostic failed")
+
+                finally:
+                    # Restore original weights after validation
+                    if ema is not None:
+                        ema.restore()
+                        if device.type == "cuda":
+                            torch.clear_autocast_cache()
+
+                    model.train()
+
+                if early_stopping is not None and early_stopping.should_stop:
+                    logger.info(
+                        "Early stopping triggered at epoch %s, step %s after %s non-improving validation checks",
+                        epoch, global_step, early_stopping.bad_checks,
+                    )
+                    break
 
     # Print epoch summary
-    summary = f"Epoch {epoch}/{total_epochs} completed. Avg Loss: {np.mean(loss_list):.4f}"
+    status = "stopped early" if early_stopping is not None and early_stopping.should_stop else "completed"
+    summary = f"Epoch {epoch}/{total_epochs} {status}. Avg Loss: {np.mean(loss_list):.4f}"
     if train_sam_iou and train_ious:
         summary += f" | Avg Train IoU: {np.mean(train_ious):.4f}"
     logger.info(summary)
     if writer is not None:
         if loss_list:
-            writer.add_scalar("Train/epoch_loss", float(np.mean(loss_list)), (epoch or 1) * len(loader))
+            writer.add_scalar("Train/epoch_loss", float(np.mean(loss_list)), global_step)
         writer.flush()
 
     return loss_list, val_metrics_list, best_score, train_ious
@@ -2971,6 +3000,7 @@ def main(
     area_reg_max_gt_area: Optional[float] = None,
     reload_diagnostics_batches: int = 0,
     checkpoint_save_mode: str = "full",
+    early_stopping: Optional[EarlyStopping] = None,
 ) -> None:
     """
     Main training function for FLAME.
@@ -3010,11 +3040,14 @@ def main(
         coarse_loss_weight: Weight for auxiliary coarse prompt BCE loss
         reload_diagnostics_batches: If >0, compare live validation weights against a fresh reload after each saved checkpoint
         checkpoint_save_mode: full, trainable_only, or none; use none for short diagnostics on low disk
+        early_stopping: Optional IoU + F1 early-stopping controller, shared across epochs
     """
     if sam_config is None:
         sam_config = SAM_CONFIG
     if sam_ckpt is None:
         sam_ckpt = SAM_CKPT
+    if early_stopping is not None and val_steps <= 0:
+        raise ValueError("Early stopping requires a positive val_steps interval")
 
     # Generate experiment name with timestamp and create directories
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -3379,6 +3412,13 @@ def main(
         }
     
         # Save parameters to JSON file
+        if early_stopping is not None:
+            model_params["training_config"]["early_stopping"] = {
+                "patience": early_stopping.patience,
+                "min_delta": early_stopping.min_delta,
+                "min_epochs": early_stopping.min_epochs,
+                "monitor": "iou + f1",
+            }
         params_save_path = os.path.join(experiment_dir, "model_params.json")
         with open(params_save_path, 'w') as f:
             json.dump(model_params, f, indent=2)
@@ -3655,6 +3695,17 @@ def main(
             logger.info("Loaded EMA weights from checkpoint.")
 
         # Initialize training state
+        if early_stopping is not None:
+            if val_loader is None or len(val_loader) == 0:
+                raise ValueError("Early stopping requires a nonempty validation loader")
+            if checkpoint_data and not reset_best_score and "early_stopping" in checkpoint_data:
+                early_stopping.load_state_dict(checkpoint_data["early_stopping"])
+            elif checkpoint_data and not reset_best_score and "score" in checkpoint_data:
+                early_stopping.load_state_dict({"reference_score": float(checkpoint_data["score"]), "bad_checks": 0})
+            logger.info(
+                "Early stopping enabled | monitor=IoU+F1 patience=%s min_delta=%s min_epochs=%s",
+                early_stopping.patience, early_stopping.min_delta, early_stopping.min_epochs,
+            )
         best_score = 0.0 if reset_best_score else (checkpoint_data.get("score", 0.0) if checkpoint_data else 0.0)
         if reset_best_score and checkpoint_data:
             logger.info("Reset best_score to 0.0 for resumed run checkpoint selection.")
@@ -3769,6 +3820,7 @@ def main(
                 reload_diagnostics_batches=reload_diagnostics_batches,
                 checkpoint_save_mode=checkpoint_save_mode,
                 writer=writer,
+                early_stopping=early_stopping,
             )
         
             # Update metrics history
@@ -3845,6 +3897,8 @@ def main(
                 True,
                 save_path=os.path.join(experiment_dir, "metrics.png")
             )
+            if early_stopping is not None and early_stopping.should_stop:
+                break
 
 
 def aggregate_epoch_metrics(val_metrics_list: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -3969,6 +4023,7 @@ def parse_arguments() -> argparse.Namespace:
         description="FLAME - Train forgery localization model using SAM2 architecture",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
+    add_early_stopping_arguments(parser)
 
     # Data configuration
     parser.add_argument(
@@ -5048,7 +5103,14 @@ def parse_arguments() -> argparse.Namespace:
         help="Whether to train the SAM IoU head"
     )
     
-    return parser.parse_args()
+    args = parser.parse_args()
+    try:
+        args.early_stopping = early_stopping_from_args(args)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.early_stopping is not None and args.val_steps <= 0:
+        parser.error("Early stopping requires --val_steps to be positive")
+    return args
 
 
 if __name__ == "__main__":
@@ -5211,4 +5273,5 @@ if __name__ == "__main__":
         area_reg_max_gt_area=args.area_reg_max_gt_area,
         reload_diagnostics_batches=args.reload_diagnostics_batches,
         checkpoint_save_mode=args.checkpoint_save_mode,
+        early_stopping=args.early_stopping,
     )
