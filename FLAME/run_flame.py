@@ -9,10 +9,10 @@ from tempfile import TemporaryDirectory
 from utils.early_stopping import add_early_stopping_arguments, early_stopping_cli_arguments
 
 # Select dataset paths and loader defaults for "windows", "server", or "wsl".
-PATH_PROFILE = "wsl"
+PATH_PROFILE = "server"
 
-JOINT_BATCH_SIZE = 64 if PATH_PROFILE == "server" else 1
-TEST_BATCH_SIZE, TEST_NUM_WORKERS = (8, 4) if PATH_PROFILE == "server" else (1, 0)
+JOINT_BATCH_SIZE = 48 if PATH_PROFILE == "server" else 1
+TEST_BATCH_SIZE, TEST_NUM_WORKERS = (64, 2) if PATH_PROFILE == "server" else (1, 0)
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_ROOT = {
@@ -260,7 +260,7 @@ if __name__ == "__main__":
 r"""
 # 在仓库根目录运行，先设置文件顶部的 PATH_PROFILE。
 conda activate flame
-
+======================训练===================================
 # 联合使用 MagicBrush 和 SID 训练，并分别使用各自的验证集
 python FLAME/run_flame.py train-joint
 
@@ -268,10 +268,7 @@ python FLAME/run_flame.py train-joint
 python FLAME/run_flame.py train-joint --authentic_ratio 0.2 --lambda_detection 1.0
 
 # 启用早停，具体参数在 FLAME/configs/training_default.json 中设置。
-python FLAME/run_flame.py train-joint --early-stopping
-
-# 最多训练 10 轮，达到早停条件时提前结束
-python FLAME/run_flame.py train-joint --early-stopping --epochs 10
+python FLAME/run_flame.py train-joint --early-stopping --epochs 20
 
 # 加入真图并启用早停
 python FLAME/run_flame.py train-joint --authentic_ratio 0.2 --lambda_detection 1.0 --early-stopping
@@ -279,14 +276,15 @@ python FLAME/run_flame.py train-joint --authentic_ratio 0.2 --lambda_detection 1
 # MagicBrush 单数据集训练，使用配置中的验证集
 python FLAME/run_flame.py train --dataset-family magicbrush --epochs 3 --batch-size 1
 
+# SID 单数据集训练，使用 sid_validation 做验证
+python FLAME/run_flame.py train --dataset-family sid --epochs 3 --batch-size 1
+
 # 单数据集训练也支持早停
 python FLAME/run_flame.py train --dataset-family magicbrush --epochs 3 --batch-size 1 --early-stopping
 
+====================使用官网权重测试===================================
 # MagicBrush 测试
 python FLAME/run_flame.py test
-
-# SID 单数据集训练，使用 sid_validation 做验证
-python FLAME/run_flame.py train --dataset-family sid --epochs 3 --batch-size 1
 
 # SID 测试
 python FLAME/run_flame.py test --dataset-family sid
@@ -297,13 +295,12 @@ python FLAME/run_flame.py test --dataset-family sid
 python FLAME/run_flame.py test --dataset-family autosplice
 python FLAME/run_flame.py test --dataset-family cocoglide
 
+=====================使用训练得到的权重测试==============================
 # 测试 results 中某次训练的 best_model.pth，自动读取同目录的 model_params.json。
 # 将 --experiment-dir 改为要评估的实验目录，结果保存在该目录的 evaluation/ 下。
-python FLAME/run_flame.py test \
-  --experiment-dir "FLAME/results/20261123_215019_DET_focal-gamma1p0_focal-alpha0p55_prompt-dim64_lr0p001_dropout-rate0p2_lad-tau0p004_forensic-o_8da0f231"
 
-# 使用同一训练权重测试 SID
-python FLAME/run_flame.py test --dataset-family sid \
+# 使用同一训练权重测试 SID 参数选择[magicbrush、sid、autosplice、cocoglide]
+python FLAME/run_flame.py test --dataset-family magicbrush \
   --experiment-dir "FLAME/results/20261123_215019_DET_focal-gamma1p0_focal-alpha0p55_prompt-dim64_lr0p001_dropout-rate0p2_lad-tau0p004_forensic-o_8da0f231"
 
 # 对单张图片推理，默认输出到 FLAME/outputs/inference/
