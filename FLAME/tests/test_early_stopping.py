@@ -113,7 +113,7 @@ class TestEarlyStopping(unittest.TestCase):
                 stopping = early_stopping_config.early_stopping_from_args(parser.parse_args(["--early-stopping"]))
                 self.assertEqual((stopping.patience, stopping.min_delta, stopping.min_epochs), (8, 0.01, 2))
 
-    def test_run_flame_forwards_optional_arguments_to_both_joint_routes(self):
+    def test_run_flame_forwards_all_joint_training_to_same_script(self):
         with (
             patch("sys.argv", ["run_flame.py", "train-joint"]),
             patch.object(run_flame, "run_script", return_value=0) as launch,
@@ -127,11 +127,79 @@ class TestEarlyStopping(unittest.TestCase):
             self.assertEqual(run_flame.main(), 0)
             self.assertIn("--early-stopping", launch.call_args.args[1])
         with (
-            patch("sys.argv", ["run_flame.py", "train-joint", "--authentic_ratio", "0", "--early-stopping"]),
-            patch.object(run_flame, "run_training", return_value=0) as launch,
+            patch("sys.argv", ["run_flame.py", "train-joint", "--authentic_ratio", "0.2", "--early-stopping"]),
+            patch.object(run_flame, "run_script", return_value=0) as launch,
         ):
             self.assertEqual(run_flame.main(), 0)
-            self.assertIn("--early-stopping", launch.call_args.args[1])
+            launch.assert_called_once_with(
+                "train_joint.py", ["--epochs", "3", "--early-stopping", "--authentic_ratio", "0.2"],
+            )
+
+    def test_joint_modes_share_config_and_forward_all_parameters(self):
+        root = train_joint.DATASET_PATHS["magicbrush"]["train"]
+        (root / "source").mkdir()
+        (root / "source" / "original.png").touch()
+        for profile, batch_size, workers in (
+            ("server", 64, (4, 2)), ("windows", 1, (0, 0)), ("wsl", 1, (0, 0)),
+        ):
+            for ratio in (0.0, 0.2):
+                command = [
+                    "train_joint.py", "--authentic-ratio", str(ratio), "--lambda-detection", "0.7",
+                    "--epochs", "10", "--early-stopping",
+                ]
+
+                def verify_command(script, arguments):
+                    self.assertEqual(script, "train.py")
+                    flags = dict(zip(arguments[::2], arguments[1::2]))
+                    self.assertEqual(flags["--authentic_ratio"], str(ratio))
+                    self.assertEqual(flags["--lambda_detection"], "0.7")
+                    self.assertEqual(flags["--epochs"], "10")
+                    self.assertEqual(flags["--batch_size"], str(batch_size))
+                    self.assertIn("--early-stopping", arguments)
+                    config = json.loads(Path(flags["--dataset_config"]).read_text())
+                    for name, worker_count in zip(("train_loader", "val_loader"), workers):
+                        self.assertEqual(config[name]["batch_size"], batch_size)
+                        self.assertEqual(config[name]["num_workers"], worker_count)
+                    return 0
+
+                with (
+                    self.subTest(profile=profile, ratio=ratio),
+                    patch("sys.argv", command),
+                    patch.object(train_joint, "PATH_PROFILE", profile),
+                    patch.object(train_joint, "JOINT_BATCH_SIZE", batch_size),
+                    patch.object(train_joint, "run_script", side_effect=verify_command) as launch,
+                ):
+                    self.assertEqual(train_joint.main(), 0)
+                    launch.assert_called_once()
+
+    def test_joint_script_defaults_to_no_authentic_samples(self):
+        with (
+            patch("sys.argv", ["train_joint.py"]),
+            patch.object(train_joint, "run_script", return_value=0) as launch,
+        ):
+            self.assertEqual(train_joint.main(), 0)
+            flags = dict(zip(launch.call_args.args[1][::2], launch.call_args.args[1][1::2]))
+            self.assertEqual(flags["--authentic_ratio"], "0.0")
+            self.assertEqual(flags["--lambda_detection"], "1.0")
+            self.assertEqual(flags["--epochs"], "3")
+
+    def test_joint_script_validates_authentic_options_and_source_images(self):
+        for options in (
+            ["--authentic-ratio", "-0.1"], ["--authentic-ratio", "nan"],
+            ["--authentic-ratio", "1.1"], ["--lambda-detection", "nan"],
+            ["--lambda-detection", "-1"], ["--epochs", "0"],
+            ["--authentic-ratio", "0.2"],
+        ):
+            with (
+                self.subTest(options=options),
+                patch("sys.argv", ["train_joint.py", *options]),
+                patch.object(train_joint, "run_script") as launch,
+                redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit) as error,
+            ):
+                train_joint.main()
+            self.assertEqual(error.exception.code, 2)
+            launch.assert_not_called()
 
     def test_single_dataset_and_standalone_joint_forward_the_flag(self):
         with tempfile.TemporaryDirectory() as temporary_dir:

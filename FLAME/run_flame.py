@@ -3,7 +3,6 @@
 import argparse
 import subprocess
 import sys
-from math import isfinite
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -12,6 +11,7 @@ from utils.early_stopping import add_early_stopping_arguments, early_stopping_cl
 # Select dataset paths and loader defaults for "windows", "server", or "wsl".
 PATH_PROFILE = "wsl"
 
+JOINT_BATCH_SIZE = 64 if PATH_PROFILE == "server" else 1
 TEST_BATCH_SIZE, TEST_NUM_WORKERS = (8, 4) if PATH_PROFILE == "server" else (1, 0)
 
 APP_DIR = Path(__file__).resolve().parent
@@ -93,41 +93,6 @@ def train(args: argparse.Namespace, early_stopping_args: list[str] | None = None
     ])
 
 
-def train_joint(authentic_ratio: float, lambda_detection: float,
-                early_stopping_args: list[str] | None = None, epochs: int = 3) -> int:
-    from utils.dataset_config import DataLoaderConfig, DatasetConfig, DatasetManagerConfig
-
-    magicbrush = DATASET_PATHS["magicbrush"]
-    sid = DATASET_PATHS["sid"]
-    batch_size, train_workers, val_workers = (4, 4, 2) if PATH_PROFILE == "server" else (1, 0, 0)
-    config = DatasetManagerConfig(
-        train_datasets=[
-            DatasetConfig("magicbrush_multiedit_train", str(magicbrush["train"].resolve()), force_resize=True),
-            DatasetConfig("sid_train", str(sid["train"].resolve()), force_resize=True),
-        ],
-        val_datasets=[
-            DatasetConfig(
-                "magicbrush_multiedit_val", str(magicbrush["val"].resolve()), is_training=False, force_resize=True,
-            ),
-            DatasetConfig("sid_validation", str(sid["val"].resolve()), is_training=False, force_resize=True),
-        ],
-        train_loader=DataLoaderConfig(
-            batch_size=batch_size, num_workers=train_workers, drop_last=False,
-            persistent_workers=train_workers > 0,
-        ),
-        val_loader=DataLoaderConfig(
-            batch_size=batch_size, num_workers=val_workers, shuffle=False, drop_last=False,
-        ),
-    )
-    return run_training(config, [
-        "--authentic_ratio", str(authentic_ratio),
-        "--lambda_detection", str(lambda_detection),
-        "--batch_size", str(batch_size),
-        "--epochs", str(epochs),
-        *(early_stopping_args or []),
-    ])
-
-
 def infer(args: argparse.Namespace) -> int:
     import torch
     from PIL import Image
@@ -189,9 +154,9 @@ def main() -> int:
     joint_training.add_argument("--epochs", "--epoch", type=int, default=3,
                                 help="Maximum number of training epochs (default: 3)")
     joint_training.add_argument("--authentic_ratio", "--authentic-ratio", type=float,
-                                help="Target fraction of authentic images to sample from each dataset's source/")
+                                help="Optional authentic-image fraction, defaults to 0 in train_joint.py")
     joint_training.add_argument("--lambda_detection", "--lambda-detection", type=float,
-                                help="Weight of the image-level detection loss (default with overrides: 1.0)")
+                                help="Detection loss weight, defaults to 1 in train_joint.py")
     for training_mode in (training, joint_training):
         add_early_stopping_arguments(training_mode)
 
@@ -229,31 +194,12 @@ def main() -> int:
         except ValueError as error:
             parser.error(str(error))
     if args.mode == "train-joint":
-        if args.epochs < 1:
-            joint_training.error("--epochs must be at least 1")
-        if args.authentic_ratio is None and args.lambda_detection is None:
-            return run_script("train_joint.py", ["--epochs", str(args.epochs), *early_stopping_args])
-        authentic_ratio = args.authentic_ratio if args.authentic_ratio is not None else 0.0
-        lambda_detection = args.lambda_detection if args.lambda_detection is not None else 1.0
-        if not 0.0 <= authentic_ratio <= 1.0:
-            joint_training.error("--authentic-ratio must be between 0 and 1")
-        if not isfinite(lambda_detection) or lambda_detection < 0.0:
-            joint_training.error("--lambda-detection must be finite and nonnegative")
-
-        for splits in DATASET_PATHS.values():
-            for split in ("train", "val"):
-                root = splits[split]
-                if not (root / "target").is_dir() or not (root / "mask").is_dir():
-                    joint_training.error(f"Expected target/ and mask/ directories inside {root}")
-        if authentic_ratio > 0.0:
-            source_dirs = [splits["train"] / "source" for splits in DATASET_PATHS.values()]
-            if not any(
-                image.is_file() and image.suffix.lower() in {".png", ".jpg", ".jpeg"}
-                for source in source_dirs if source.is_dir()
-                for image in source.iterdir()
-            ):
-                joint_training.error("Authentic training requires images in a training dataset's source/ directory")
-        return train_joint(authentic_ratio, lambda_detection, early_stopping_args, epochs=args.epochs)
+        arguments = ["--epochs", str(args.epochs), *early_stopping_args]
+        if args.authentic_ratio is not None:
+            arguments.extend(["--authentic_ratio", str(args.authentic_ratio)])
+        if args.lambda_detection is not None:
+            arguments.extend(["--lambda_detection", str(args.lambda_detection)])
+        return run_script("train_joint.py", arguments)
 
     if args.mode == "test" and args.experiment_dir is not None:
         experiment_dir = args.experiment_dir.resolve()
